@@ -35,6 +35,26 @@ enum class State {
 
 State currentState = State::IDLE;
 
+// ---- 翻译模式 ----
+bool translateMode = false;
+
+// 检测唤醒指令（支持中文、挪威语、英语）
+bool isTranslateOn(const String& text) {
+    return text.indexOf("翻译模式开启") >= 0 ||
+           text.indexOf("翻译模式") >= 0 ||
+           text.indexOf("oversettelse") >= 0 ||
+           text.indexOf("translation mode") >= 0 ||
+           text.indexOf("translate mode") >= 0;
+}
+
+bool isTranslateOff(const String& text) {
+    return text.indexOf("翻译模式关闭") >= 0 ||
+           text.indexOf("退出翻译") >= 0 ||
+           text.indexOf("avslutt oversettelse") >= 0 ||
+           text.indexOf("stop translation") >= 0 ||
+           text.indexOf("exit translation") >= 0;
+}
+
 // ---- LED 工具 ----
 void ledOn()  { digitalWrite(LED_PIN, HIGH); }
 void ledOff() { digitalWrite(LED_PIN, LOW); }
@@ -98,7 +118,10 @@ void loop() {
                 }
                 currentState = State::RECORDING;
                 ledOn();
-                displayShow("Recording...", "Release to send");
+                if (translateMode)
+                    displayShow("[Translate]", "Recording...", "Release to send");
+                else
+                    displayShow("Recording...", "Release to send");
                 Serial.println("[Pixel] Recording started");
             }
             break;
@@ -152,17 +175,63 @@ void loop() {
             }
 
             Serial.printf("[Pixel] Transcript: %s\n", transcript.c_str());
+
+            // ---- 检测翻译模式指令 ----
+            String transcriptLower = transcript;
+            transcriptLower.toLowerCase();
+
+            if (isTranslateOff(transcriptLower)) {
+                translateMode = false;
+                displayShow("Pixel", "Chat mode", "Ready!");
+                size_t sz = speakText("好的，退出翻译模式。", "zh", mp3Buf, MP3_BUF_SIZE);
+                if (sz > 0) playMp3Buffer(mp3Buf, sz);
+                currentState = State::IDLE;
+                break;
+            }
+
+            if (isTranslateOn(transcriptLower)) {
+                translateMode = true;
+                displayShow("Pixel", "Translate ON", "Say anything!");
+                size_t sz = speakText("翻译模式已开启，请说话。", "zh", mp3Buf, MP3_BUF_SIZE);
+                if (sz > 0) playMp3Buffer(mp3Buf, sz);
+                currentState = State::IDLE;
+                break;
+            }
+
+            // ---- 翻译模式 ----
+            if (translateMode) {
+                displayShow("[Translate]", transcript.substring(0, 20).c_str());
+                String srcLang = detectLang(transcript);
+                TranslateResult result = translateText(transcript, srcLang);
+
+                if (result.text.isEmpty()) {
+                    displayShow("ERROR", "Translate", "failed");
+                    delay(2000);
+                    currentState = State::IDLE;
+                    break;
+                }
+
+                Serial.printf("[Pixel] Translation: %s\n", result.text.c_str());
+                displayShow("->", result.text.substring(0, 20).c_str(),
+                            result.text.length() > 20 ? result.text.substring(20, 40).c_str() : "");
+
+                size_t mp3Size = speakText(result.text, result.targetLang, mp3Buf, MP3_BUF_SIZE);
+                if (mp3Size > 0) {
+                    ledOn();
+                    playMp3Buffer(mp3Buf, mp3Size);
+                    ledOff();
+                }
+                displayShow("[Translate]", "Ready!", "Say anything");
+                currentState = State::IDLE;
+                break;
+            }
+
+            // ---- 普通对话模式 ----
             displayShow("Got it:", transcript.substring(0, 20).c_str());
-            delay(800);
-
-            currentState = State::THINKING;
-            // 传递转写结果给 THINKING 状态（用全局 String）
-            static String pendingText;
-            pendingText = transcript;
-
-            // 继续 THINKING 立刻（fallthrough 不适合 switch，用 goto 或直接执行）
+            delay(500);
             displayShow("Thinking...");
-            String reply = chatWithPixel(pendingText);
+
+            String reply = chatWithPixel(transcript);
             if (reply.isEmpty()) {
                 displayShow("ERROR", "Chat failed");
                 delay(2000);
@@ -174,7 +243,6 @@ void loop() {
             displayShow("Pixel:", reply.substring(0, 20).c_str(),
                         reply.length() > 20 ? reply.substring(20, 40).c_str() : "");
 
-            // TTS
             String lang = detectLang(reply);
             size_t mp3Size = speakText(reply, lang, mp3Buf, MP3_BUF_SIZE);
             if (mp3Size == 0) {

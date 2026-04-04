@@ -218,3 +218,22 @@ String detectLang(const String& text) {
     }
     return "en";  // 默认英文（挪威语也用 en 的 TTS 效果可接受）
 }
+
+// 翻译文字，返回翻译结果和目标语言
+struct TranslateResult { String text; String targetLang; };
+
+TranslateResult translateText(const String& text, const String& sourceLang) {
+    JsonDocument req;
+    req["text"]        = text;
+    req["source_lang"] = sourceLang;
+    req["target_lang"] = "auto";
+    String body;
+    serializeJson(req, body);
+
+    String resp = httpPostJson("/translate", body);
+    if (resp.isEmpty()) return {"", ""};
+
+    JsonDocument doc;
+    if (deserializeJson(doc, resp) != DeserializationError::Ok) return {"", ""};
+    return { doc["translation"].as<String>(), doc["target_lang"].as<String>() };
+}
