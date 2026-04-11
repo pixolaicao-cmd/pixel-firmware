@@ -1,239 +1,317 @@
 #pragma once
+/**
+ * Pixel AI — 云端 API 封装
+ * 主接口：voicePipeline()   音频 → 全流程 → MP3（单次调用）
+ * 备用接口：transcribeAudio / chatWithPixel / speakText（分步调试用）
+ */
+
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include "config.h"
 
-// ---- HTTP 工具 ----
+// ── 内部：HTTP 读响应 body（跳过 headers）────────────────────
 
-// 发送 multipart/form-data（上传音频）
-// 返回响应 body，失败返回空
-String httpPostMultipart(const char* path, const uint8_t* fileData, size_t fileSize,
-                         const char* fieldName, const char* fileName, const char* mimeType) {
+static String _readBody(WiFiClientSecure& client, int timeoutMs) {
+    // 跳过 headers
+    unsigned long t = millis() + timeoutMs;
+    while (client.connected() && millis() < t) {
+        String line = client.readStringUntil('\n');
+        if (line == "\r" || line == "\r\n" || line.length() == 0) break;
+    }
+    String body = "";
+    t = millis() + timeoutMs;
+    while (client.connected() && millis() < t) {
+        while (client.available()) {
+            body += (char)client.read();
+            t = millis() + timeoutMs;  // 收到数据就续期
+        }
+        delay(5);
+    }
+    return body;
+}
+
+// ── 内部：读二进制响应 body（跳过 headers）──────────────────
+
+static size_t _readBinaryBody(WiFiClientSecure& client, uint8_t* buf,
+                               size_t bufSize, int timeoutMs) {
+    // 跳过 headers，顺便读 X-Transcript / X-Reply header
+    unsigned long t = millis() + timeoutMs;
+    while (client.connected() && millis() < t) {
+        String line = client.readStringUntil('\n');
+        if (line == "\r" || line == "\r\n" || line.length() == 0) break;
+    }
+    size_t total = 0;
+    t = millis() + timeoutMs;
+    while (client.connected() && total < bufSize && millis() < t) {
+        if (client.available()) {
+            int n = client.read(buf + total, bufSize - total);
+            if (n > 0) { total += n; t = millis() + timeoutMs; }
+        }
+        delay(1);
+    }
+    return total;
+}
+
+// ── 公开：JSON POST ──────────────────────────────────────────
+
+String httpPostJson(const char* path, const String& body,
+                    int timeoutMs = HTTP_TIMEOUT_MS,
+                    const String& deviceToken = "") {
     WiFiClientSecure client;
-    client.setInsecure();   // 跳过 SSL 证书验证（生产可换成证书指纹）
-    client.setTimeout(20000);
+    client.setInsecure();
+    client.setTimeout(timeoutMs / 1000 + 5);
 
     if (!client.connect(API_HOST, API_PORT)) {
-        Serial.println("[API] Connection failed");
+        Serial.printf("[API] Connect failed: %s\n", path);
         return "";
     }
+    client.printf("POST %s HTTP/1.1\r\nHost: %s\r\n", path, API_HOST);
+    client.printf("Content-Type: application/json\r\n");
+    client.printf("Content-Length: %d\r\n", (int)body.length());
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
+    client.printf("Connection: close\r\n\r\n");
+    client.print(body);
 
-    const String boundary = "----PixelBoundary7MA4YWxkTrZu0gW";
-    String partHeader = "--" + boundary + "\r\n"
-        "Content-Disposition: form-data; name=\"" + fieldName + "\"; filename=\"" + fileName + "\"\r\n"
-        "Content-Type: " + mimeType + "\r\n\r\n";
-    String partFooter = "\r\n--" + boundary + "--\r\n";
+    String resp = _readBody(client, timeoutMs);
+    client.stop();
+    return resp;
+}
 
-    size_t contentLength = partHeader.length() + fileSize + partFooter.length();
+// ── 公开：JSON GET ────────────────────────────────────────────
 
-    // Request headers
-    client.printf("POST %s HTTP/1.1\r\n", path);
-    client.printf("Host: %s\r\n", API_HOST);
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-    client.printf("Content-Length: %d\r\n", (int)contentLength);
+String httpGetJson(const char* path, const String& deviceToken = "") {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
+
+    if (!client.connect(API_HOST, API_PORT)) return "";
+    client.printf("GET %s HTTP/1.1\r\nHost: %s\r\n", path, API_HOST);
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
     client.printf("Connection: close\r\n\r\n");
 
-    // Body
-    client.print(partHeader);
-    const size_t CHUNK = 1024;
+    String resp = _readBody(client, HTTP_TIMEOUT_MS);
+    client.stop();
+    return resp;
+}
+
+// ── 公开：multipart/form-data POST ───────────────────────────
+
+String httpPostMultipart(const char* path,
+                         const uint8_t* fileData, size_t fileSize,
+                         const char* fieldName, const char* fileName,
+                         const char* mimeType,
+                         const String& deviceToken = "") {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
+
+    if (!client.connect(API_HOST, API_PORT)) return "";
+
+    const String bnd = "----PixelBnd7MA4YWxk";
+    String head = "--" + bnd + "\r\nContent-Disposition: form-data; name=\"" +
+                  fieldName + "\"; filename=\"" + fileName + "\"\r\n" +
+                  "Content-Type: " + mimeType + "\r\n\r\n";
+    String tail = "\r\n--" + bnd + "--\r\n";
+    int contentLen = head.length() + fileSize + tail.length();
+
+    client.printf("POST %s HTTP/1.1\r\nHost: %s\r\n", path, API_HOST);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", bnd.c_str());
+    client.printf("Content-Length: %d\r\n", contentLen);
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
+    client.printf("Connection: close\r\n\r\n");
+    client.print(head);
+
+    const size_t CHUNK = 2048;
     size_t sent = 0;
     while (sent < fileSize) {
-        size_t toSend = min(CHUNK, fileSize - sent);
-        client.write(fileData + sent, toSend);
-        sent += toSend;
+        size_t n = min(CHUNK, fileSize - sent);
+        client.write(fileData + sent, n);
+        sent += n;
     }
-    client.print(partFooter);
+    client.print(tail);
 
-    // Read response
-    String response = "";
-    unsigned long timeout = millis() + 15000;
-    bool headersEnded = false;
-    while (client.connected() && millis() < timeout) {
-        while (client.available()) {
-            String line = client.readStringUntil('\n');
-            if (!headersEnded) {
-                if (line == "\r") headersEnded = true;
-            } else {
-                response += line + "\n";
-            }
-        }
-        if (headersEnded && response.length() > 0) break;
-        delay(10);
-    }
+    String resp = _readBody(client, HTTP_TIMEOUT_MS);
     client.stop();
-    return response;
+    return resp;
 }
 
-// 发送 JSON POST
-String httpPostJson(const char* path, const String& jsonBody) {
+// ============================================================
+// 🎯 主接口：音频 → AI → MP3（/api/voice 单次调用）
+// 服务端完成 STT + Chat + TTS，设备只做录音和播放
+// ============================================================
+
+struct VoiceResult {
+    bool    success;
+    size_t  mp3Size;       // mp3Buf 里的有效字节数
+    String  transcript;   // 转写原文（调试用）
+    String  reply;        // AI 回复文字（调试用）
+    String  errorMsg;
+};
+
+VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
+                           uint8_t* mp3Buf, size_t mp3BufSize,
+                           const String& deviceToken = "") {
+    VoiceResult result = {false, 0, "", "", ""};
+
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
+    client.setTimeout(VOICE_TIMEOUT_MS / 1000 + 10);
 
     if (!client.connect(API_HOST, API_PORT)) {
-        Serial.println("[API] Connection failed");
-        return "";
+        result.errorMsg = "connect failed";
+        return result;
     }
 
-    client.printf("POST %s HTTP/1.1\r\n", path);
-    client.printf("Host: %s\r\n", API_HOST);
-    client.printf("Content-Type: application/json\r\n");
-    client.printf("Content-Length: %d\r\n", (int)jsonBody.length());
-    client.printf("Connection: close\r\n\r\n");
-    client.print(jsonBody);
+    const String bnd = "----PixelVoiceBnd";
+    String head = "--" + bnd + "\r\nContent-Disposition: form-data; name=\"file\";"
+                  " filename=\"rec.wav\"\r\nContent-Type: audio/wav\r\n\r\n";
+    String tail = "\r\n--" + bnd + "--\r\n";
+    int contentLen = head.length() + wavSize + tail.length();
 
-    String response = "";
-    unsigned long timeout = millis() + 15000;
-    bool headersEnded = false;
-    while (client.connected() && millis() < timeout) {
-        while (client.available()) {
-            String line = client.readStringUntil('\n');
-            if (!headersEnded) {
-                if (line == "\r") headersEnded = true;
-            } else {
-                response += line + "\n";
-            }
-        }
-        if (headersEnded && response.length() > 0) break;
-        delay(10);
+    client.printf("POST /api/voice HTTP/1.1\r\nHost: %s\r\n", API_HOST);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", bnd.c_str());
+    client.printf("Content-Length: %d\r\n", contentLen);
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
+    client.printf("Connection: close\r\n\r\n");
+    client.print(head);
+
+    // 分块上传音频
+    const size_t CHUNK = 2048;
+    size_t sent = 0;
+    while (sent < wavSize) {
+        size_t n = min(CHUNK, wavSize - sent);
+        client.write(wavData + sent, n);
+        sent += n;
     }
-    client.stop();
-    return response;
-}
+    client.print(tail);
 
-// 下载二进制数据到缓冲区，返回实际下载字节数
-size_t httpGetBinary(const char* path, uint8_t* outBuf, size_t outBufSize) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(20000);
+    Serial.printf("[API] Voice sent %d bytes, waiting response...\n", (int)wavSize);
 
-    if (!client.connect(API_HOST, API_PORT)) return 0;
-
-    client.printf("GET %s HTTP/1.1\r\n", API_HOST);
-    client.printf("Host: %s\r\n", API_HOST);
-    client.printf("Connection: close\r\n\r\n");
-
-    // 跳过 headers
-    unsigned long timeout = millis() + 10000;
-    while (client.connected() && millis() < timeout) {
+    // 读响应 headers（提取 X-Transcript / X-Reply）
+    unsigned long t = millis() + VOICE_TIMEOUT_MS;
+    int statusCode = 0;
+    while (client.connected() && millis() < t) {
         String line = client.readStringUntil('\n');
-        if (line == "\r") break;
+        line.trim();
+        if (line.startsWith("HTTP/")) {
+            // "HTTP/1.1 200 OK"
+            int sp = line.indexOf(' ');
+            if (sp > 0) statusCode = line.substring(sp + 1, sp + 4).toInt();
+        }
+        if (line.startsWith("X-Transcript:"))
+            result.transcript = line.substring(13).trim();
+        if (line.startsWith("X-Reply:"))
+            result.reply = line.substring(8).trim();
+        if (line.length() == 0) break;  // headers 结束
     }
 
+    if (statusCode != 200) {
+        // 读错误 body
+        String errBody = "";
+        t = millis() + 5000;
+        while (client.connected() && millis() < t && errBody.length() < 200) {
+            if (client.available()) errBody += (char)client.read();
+            delay(1);
+        }
+        client.stop();
+        result.errorMsg = String("HTTP ") + statusCode + ": " + errBody;
+        return result;
+    }
+
+    // 读 MP3 body
     size_t total = 0;
-    timeout = millis() + 15000;
-    while (client.connected() && total < outBufSize && millis() < timeout) {
+    t = millis() + VOICE_TIMEOUT_MS;
+    while (client.connected() && total < mp3BufSize && millis() < t) {
         if (client.available()) {
-            int b = client.read(outBuf + total, outBufSize - total);
-            if (b > 0) total += b;
+            int n = client.read(mp3Buf + total, mp3BufSize - total);
+            if (n > 0) { total += n; t = millis() + VOICE_TIMEOUT_MS; }
         }
         delay(1);
     }
     client.stop();
-    return total;
+
+    Serial.printf("[API] Voice MP3: %d bytes\n", (int)total);
+    if (total < 100) {
+        result.errorMsg = "MP3 too small";
+        return result;
+    }
+
+    result.success = true;
+    result.mp3Size  = total;
+    return result;
 }
 
-// ---- Pixel API 封装 ----
+// ============================================================
+// 分步接口（调试 / 降级备用）
+// ============================================================
 
-// 上传 WAV → 返回转写文字
-String transcribeAudio(const uint8_t* wavData, size_t wavSize) {
-    Serial.println("[API] Transcribing...");
+String transcribeAudio(const uint8_t* wavData, size_t wavSize,
+                       const String& deviceToken = "") {
     String resp = httpPostMultipart(
-        "/transcribe", wavData, wavSize,
-        "file", "recording.wav", "audio/wav"
-    );
+        "/api/transcribe", wavData, wavSize,
+        "file", "rec.wav", "audio/wav", deviceToken);
     if (resp.isEmpty()) return "";
-
     JsonDocument doc;
     if (deserializeJson(doc, resp) != DeserializationError::Ok) return "";
     return doc["text"].as<String>();
 }
 
-// 文字 → Pixel 回复
-String chatWithPixel(const String& message, const String& userId = "esp32") {
-    Serial.printf("[API] Chat: %s\n", message.c_str());
+String chatWithPixel(const String& msg, const String& deviceToken = "") {
     JsonDocument req;
-    req["message"]  = message;
-    req["user_id"]  = userId;
-    String body;
-    serializeJson(req, body);
-
-    String resp = httpPostJson("/chat", body);
+    req["message"] = msg;
+    req["user_id"] = "esp32";
+    String body; serializeJson(req, body);
+    String resp = httpPostJson("/api/chat", body, HTTP_TIMEOUT_MS, deviceToken);
     if (resp.isEmpty()) return "";
-
     JsonDocument doc;
     if (deserializeJson(doc, resp) != DeserializationError::Ok) return "";
     return doc["reply"].as<String>();
 }
 
-// 文字 → MP3 音频，下载到 outBuf，返回字节数
 size_t speakText(const String& text, const String& lang,
-                 uint8_t* outBuf, size_t outBufSize) {
-    Serial.printf("[API] TTS: %s\n", text.c_str());
-    JsonDocument req;
-    req["text"] = text;
-    req["lang"] = lang;
-    String body;
-    serializeJson(req, body);
-
-    // 先发 POST，然后直接读取 binary response
+                 uint8_t* mp3Buf, size_t mp3BufSize,
+                 const String& deviceToken = "") {
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
     if (!client.connect(API_HOST, API_PORT)) return 0;
 
-    client.printf("POST /speak HTTP/1.1\r\n");
-    client.printf("Host: %s\r\n", API_HOST);
-    client.printf("Content-Type: application/json\r\n");
-    client.printf("Content-Length: %d\r\n", (int)body.length());
+    JsonDocument req;
+    req["text"] = text; req["lang"] = lang;
+    String body; serializeJson(req, body);
+
+    client.printf("POST /api/speak HTTP/1.1\r\nHost: %s\r\n", API_HOST);
+    client.printf("Content-Type: application/json\r\nContent-Length: %d\r\n", (int)body.length());
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
     client.printf("Connection: close\r\n\r\n");
     client.print(body);
 
-    // 跳过 headers
-    unsigned long timeout = millis() + 10000;
-    while (client.connected() && millis() < timeout) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r") break;
-    }
-
-    size_t total = 0;
-    timeout = millis() + 15000;
-    while (client.connected() && total < outBufSize && millis() < timeout) {
-        if (client.available()) {
-            int b = client.read(outBuf + total, outBufSize - total);
-            if (b > 0) total += b;
-        }
-        delay(1);
-    }
-    client.stop();
-    Serial.printf("[API] TTS downloaded %d bytes\n", (int)total);
-    return total;
+    return _readBinaryBody(client, mp3Buf, mp3BufSize, HTTP_TIMEOUT_MS);
 }
 
-// 自动检测语言（简单规则，云端会更准）
+// 简单语言检测
 String detectLang(const String& text) {
     for (int i = 0; i < (int)text.length() - 1; i++) {
-        uint8_t c = (uint8_t)text[i];
-        if (c >= 0xE4 && c <= 0xE9) return "zh";  // 中文 UTF-8 范围
+        if ((uint8_t)text[i] >= 0xE4 && (uint8_t)text[i] <= 0xE9) return "zh";
     }
-    return "en";  // 默认英文（挪威语也用 en 的 TTS 效果可接受）
+    return "en";
 }
 
-// 翻译文字，返回翻译结果和目标语言
 struct TranslateResult { String text; String targetLang; };
 
-TranslateResult translateText(const String& text, const String& sourceLang) {
+TranslateResult translateText(const String& text, const String& srcLang,
+                               const String& deviceToken = "") {
     JsonDocument req;
-    req["text"]        = text;
-    req["source_lang"] = sourceLang;
-    req["target_lang"] = "auto";
-    String body;
-    serializeJson(req, body);
-
-    String resp = httpPostJson("/translate", body);
+    req["text"] = text; req["source_lang"] = srcLang; req["target_lang"] = "auto";
+    String body; serializeJson(req, body);
+    String resp = httpPostJson("/api/translate", body, HTTP_TIMEOUT_MS, deviceToken);
     if (resp.isEmpty()) return {"", ""};
-
     JsonDocument doc;
     if (deserializeJson(doc, resp) != DeserializationError::Ok) return {"", ""};
-    return { doc["translation"].as<String>(), doc["target_lang"].as<String>() };
+    return {doc["translation"].as<String>(), doc["target_lang"].as<String>()};
 }
