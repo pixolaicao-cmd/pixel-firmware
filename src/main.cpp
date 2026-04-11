@@ -10,6 +10,7 @@
  */
 
 #include <Arduino.h>
+#include <M5Unified.h>
 #include "config.h"
 #include "display.h"
 #include "wifi_mgr.h"
@@ -137,6 +138,10 @@ void showPairingError(const String& msg) {
 void setup() {
     Serial.begin(115200);
     Serial.println("\n[Pixel] Booting...");
+
+    // M5Unified 初始化（LCD、触摸、IMU、AXP2101 电源）
+    auto cfg = M5.config();
+    M5.begin(cfg);
 
     // GPIO（CoreS3 上 LED_PIN = -1，跳过 pinMode）
     if (LED_PIN >= 0) {
