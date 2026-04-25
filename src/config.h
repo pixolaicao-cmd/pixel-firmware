@@ -10,6 +10,12 @@
 #define API_PORT    443
 #define API_USE_SSL true
 
+// TLS 证书验证（默认 false —— setInsecure()）
+// ⚠️ 硬件到货后，先用默认 false 验证整条流程工作正常，再改成 true 启用证书校验
+//    启用后若证书链问题导致连接失败，设备无法上线，务必先在稳定环境验证
+// Vercel *.vercel.app 使用 Let's Encrypt 签发（ISRG Root X1 / X2），证书见 cert.h
+#define USE_CERT_PINNING false
+
 // 设备 token（首次启动为空，配对后写入 NVS Flash 持久化）
 #define NVS_NAMESPACE   "pixel"
 #define NVS_TOKEN_KEY   "device_token"

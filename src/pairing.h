@@ -4,7 +4,7 @@
  *
  * 启动时检查 NVS 是否有 device_token：
  *   有 → 跳过配对，直接用
- *   无 → 向后端注册，显示 6 位配对码，等用户在 App 输入
+ *   无 → 向后端注册，显示 8 位配对码（字母+数字），等用户在 App 输入
  */
 
 #include <Arduino.h>
@@ -65,8 +65,8 @@ struct PairingResult {
 };
 
 /**
- * 向后端注册设备，返回 6 位配对码。
- * 若已配对，返回空字符串（调用方跳过配对）。
+ * 向后端注册设备，返回 8 位配对码（字母+数字，已排除 0/O/1/I/L）。
+ * 若已配对，返回 "PAIRED"（调用方跳过配对）。
  */
 String registerDevice(const String& deviceId) {
     JsonDocument req;

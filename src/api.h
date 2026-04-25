@@ -8,6 +8,20 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include "config.h"
+#include "cert.h"
+
+// ── TLS 配置（统一入口，便于一处切换证书验证策略）────────────
+static inline void configureTls(WiFiClientSecure& client) {
+#if USE_CERT_PINNING
+    // 同时信任 ISRG X1（RSA）和 X2（ECDSA）
+    client.setCACert(ISRG_ROOT_X1_PEM);
+    // 注：ESP32 的 setCACert 通常只接受一个证书链
+    // 若 Vercel 切换到 X2，需改为 client.setCACert(ISRG_ROOT_X2_PEM)
+    // 更稳妥做法：ESP-IDF 5.x 的 setCACertBundle 支持多根，后续可升级
+#else
+    client.setInsecure();  // ⚠️ 开发阶段：跳过证书校验
+#endif
+}
 
 // ── 内部：HTTP 读响应 body（跳过 headers）────────────────────
 
@@ -58,7 +72,7 @@ String httpPostJson(const char* path, const String& body,
                     int timeoutMs = HTTP_TIMEOUT_MS,
                     const String& deviceToken = "") {
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTls(client);
     client.setTimeout(timeoutMs / 1000 + 5);
 
     if (!client.connect(API_HOST, API_PORT)) {
@@ -82,7 +96,7 @@ String httpPostJson(const char* path, const String& body,
 
 String httpGetJson(const char* path, const String& deviceToken = "") {
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTls(client);
     client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
 
     if (!client.connect(API_HOST, API_PORT)) return "";
@@ -104,7 +118,7 @@ String httpPostMultipart(const char* path,
                          const char* mimeType,
                          const String& deviceToken = "") {
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTls(client);
     client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
 
     if (!client.connect(API_HOST, API_PORT)) return "";
@@ -157,7 +171,7 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
     VoiceResult result = {false, 0, "", "", ""};
 
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTls(client);
     client.setTimeout(VOICE_TIMEOUT_MS / 1000 + 10);
 
     if (!client.connect(API_HOST, API_PORT)) {
@@ -276,7 +290,7 @@ size_t speakText(const String& text, const String& lang,
                  uint8_t* mp3Buf, size_t mp3BufSize,
                  const String& deviceToken = "") {
     WiFiClientSecure client;
-    client.setInsecure();
+    configureTls(client);
     client.setTimeout(HTTP_TIMEOUT_MS / 1000 + 5);
     if (!client.connect(API_HOST, API_PORT)) return 0;
 
