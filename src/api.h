@@ -178,6 +178,10 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
         result.errorMsg = "connect failed";
         return result;
     }
+    // 关 Nagle —— 否则每个 client.printf 小写 (header 行) 都会被 ~200ms ACK
+    // 延迟拖一次。叠加 32 个 2KB 上传 chunk 后整个上传从 ~3s 变成 30~60s,
+    // 超过 Vercel function timeout 直接 502 / 关连接。
+    client.setNoDelay(true);
 
     const String bnd = "----PixelVoiceBnd";
     String head = "--" + bnd + "\r\nContent-Disposition: form-data; name=\"file\";"
@@ -185,30 +189,73 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
     String tail = "\r\n--" + bnd + "--\r\n";
     int contentLen = head.length() + wavSize + tail.length();
 
-    client.printf("POST /api/voice HTTP/1.1\r\nHost: %s\r\n", API_HOST);
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", bnd.c_str());
-    client.printf("Content-Length: %d\r\n", contentLen);
-    if (deviceToken.length() > 0)
-        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
-    client.printf("Connection: close\r\n\r\n");
-    client.print(head);
+    // 把 HTTP 头拼成一个 String 一次性 write —— 避免逐行触发 TLS encrypt+send
+    String reqHead;
+    reqHead.reserve(512);
+    reqHead += "POST /api/voice HTTP/1.1\r\nHost: ";
+    reqHead += API_HOST;
+    reqHead += "\r\nContent-Type: multipart/form-data; boundary=";
+    reqHead += bnd;
+    reqHead += "\r\nContent-Length: ";
+    reqHead += String(contentLen);
+    reqHead += "\r\n";
+    if (deviceToken.length() > 0) {
+        reqHead += "Authorization: Bearer ";
+        reqHead += deviceToken;
+        reqHead += "\r\n";
+    }
+    reqHead += "Connection: close\r\n\r\n";
+    reqHead += head;
+    client.write((const uint8_t*)reqHead.c_str(), reqHead.length());
 
-    // 分块上传音频
+    // 上传音频 —— 2KB chunk 与 mbedtls 默认 record 大小对齐
+    // write() 在 TLS 压力下可能返回 0（缓冲满）或小于请求的字节数 → 必须支持
+    // partial write 重试，否则一遇到 0 就 abort。
     const size_t CHUNK = 2048;
     size_t sent = 0;
+    int zeroRetries = 0;
+    const unsigned long uploadDeadline = millis() + VOICE_TIMEOUT_MS;
     while (sent < wavSize) {
+        if (millis() > uploadDeadline) {
+            Serial.println("[API] upload deadline exceeded");
+            client.stop(); result.errorMsg = "upload timeout"; return result;
+        }
+        if (!client.connected()) {
+            Serial.println("[API] connection dropped during upload");
+            client.stop(); result.errorMsg = "upload disconnect"; return result;
+        }
         size_t n = min(CHUNK, wavSize - sent);
-        client.write(wavData + sent, n);
-        sent += n;
+        size_t written = client.write(wavData + sent, n);
+        if (written == 0) {
+            // TLS 缓冲满 —— 让出 CPU 等 ACK，再试，最多 200 次（~2s）
+            if (++zeroRetries > 200) {
+                Serial.println("[API] write() stalled too long");
+                client.stop(); result.errorMsg = "upload stalled"; return result;
+            }
+            delay(10);
+            continue;
+        }
+        zeroRetries = 0;
+        sent += written;
     }
-    client.print(tail);
+    client.write((const uint8_t*)tail.c_str(), tail.length());
+    client.flush();
 
     Serial.printf("[API] Voice sent %d bytes, waiting response...\n", (int)wavSize);
 
     // 读响应 headers（提取 X-Transcript / X-Reply）
+    // 注意：服务端用 Connection: close —— 它写完响应就关 socket，
+    // client.connected() 立刻变 false 但 TLS 缓冲还有数据。
+    // 必须用 (connected() || available()) 否则 statusCode 永远是 0。
     unsigned long t = millis() + VOICE_TIMEOUT_MS;
     int statusCode = 0;
-    while (client.connected() && millis() < t) {
+    while (millis() < t) {
+        if (!client.available() && !client.connected()) {
+            // 还没数据但 socket 也关了 — 没救了
+            break;
+        }
+        if (!client.available()) { delay(5); continue; }
+
         String line = client.readStringUntil('\n');
         line.trim();
         if (line.startsWith("HTTP/")) {
@@ -231,9 +278,14 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
         // 读错误 body
         String errBody = "";
         t = millis() + 5000;
-        while (client.connected() && millis() < t && errBody.length() < 200) {
-            if (client.available()) errBody += (char)client.read();
-            delay(1);
+        while (millis() < t && errBody.length() < 200) {
+            if (client.available()) {
+                errBody += (char)client.read();
+            } else if (!client.connected()) {
+                break;
+            } else {
+                delay(2);
+            }
         }
         client.stop();
         result.errorMsg = String("HTTP ") + statusCode + ": " + errBody;
@@ -243,12 +295,15 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
     // 读 MP3 body
     size_t total = 0;
     t = millis() + VOICE_TIMEOUT_MS;
-    while (client.connected() && total < mp3BufSize && millis() < t) {
+    while (total < mp3BufSize && millis() < t) {
         if (client.available()) {
             int n = client.read(mp3Buf + total, mp3BufSize - total);
             if (n > 0) { total += n; t = millis() + VOICE_TIMEOUT_MS; }
+        } else if (!client.connected()) {
+            break;
+        } else {
+            delay(1);
         }
-        delay(1);
     }
     client.stop();
 

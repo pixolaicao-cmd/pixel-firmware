@@ -53,12 +53,21 @@ void recorderInit() {
 
 /**
  * 录音并将结果写入 outBuf（WAV header + PCM data）
- * outBuf      指向 PSRAM 缓冲（main.cpp 已分配）
- * outBufSize  缓冲总字节数（含 44 字节 header 余量）
- * maxMs       最长录音时长
- * 返回        写入 outBuf 的总字节数（含 header）；录音失败返回 0
+ * outBuf       指向 PSRAM 缓冲（main.cpp 已分配）
+ * outBufSize   缓冲总字节数（含 44 字节 header 余量）
+ * maxMs        最长录音时长
+ * shouldStop   每 chunk 调一次的回调；返回 true 立即停止录音（如按键释放）
+ * onTick       每 chunk 调一次的回调，参数是已录音时长（ms），用于更新 UI
+ *
+ * 返回         写入 outBuf 的总字节数（含 header）；录音失败返回 0
+ *
+ * 注意：本函数从头到尾只 begin / end 一次 mic_task，避免在 chunk 之间
+ * 反复进入 i2s_driver_install / uninstall 导致 mic_task 在 i2s_read 时
+ * 拿到已被释放的 rx queue（EXCVADDR=0x1c LoadProhibited）。
  */
-size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs) {
+size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs,
+                      bool (*shouldStop)() = nullptr,
+                      void (*onTick)(uint32_t elapsedMs) = nullptr) {
     if (!outBuf || outBufSize <= sizeof(WavHeader)) return 0;
 
     // I2S 切换：让出 Speaker（如果之前在用），再拿 Mic
@@ -76,6 +85,7 @@ size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs) {
 
     uint32_t startMs        = millis();
     size_t   samplesWritten = 0;
+    uint32_t lastTickMs     = 0;
 
     while ((millis() - startMs) < maxMs &&
            samplesWritten + MIC_CHUNK_SAMPLES <= maxSamples) {
@@ -95,7 +105,22 @@ size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs) {
         // 等 DMA 把这一块填满（典型 16ms）
         while (M5.Mic.isRecording()) { delay(1); }
         samplesWritten += MIC_CHUNK_SAMPLES;
+
+        uint32_t elapsed = millis() - startMs;
+        // ~250ms 调一次 onTick，避免每 16ms 重绘 LCD 抢 SPI
+        if (onTick && elapsed - lastTickMs >= 250) {
+            onTick(elapsed);
+            lastTickMs = elapsed;
+        }
+        // 用户松手 / 业务层要求停 → 立刻退出
+        if (shouldStop && shouldStop()) break;
     }
+
+    // 关键：在函数返回前 end() mic，让 mic_task 安全退出后再让出 I2S。
+    // 否则上层在我们退出后跑 voicePipeline / Speaker.begin 时，
+    // mic_task 仍持有 rx queue → i2s_driver_uninstall 后 mic_task 下一轮
+    // i2s_read 拿空指针 → LoadProhibited @ Mic_Class.cpp:232
+    M5.Mic.end();
 
     // 写 WAV 文件头
     const uint32_t audioBytes = static_cast<uint32_t>(samplesWritten * sizeof(int16_t));
@@ -109,4 +134,9 @@ size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs) {
                   (unsigned)samplesWritten,
                   (unsigned)(millis() - startMs));
     return headerSize + audioBytes;
+}
+
+// 兼容旧调用点 — 这里 mic 已经在 recordToBuffer 内部 end 过，再调一次安全。
+inline void recorderStopMic() {
+    if (M5.Mic.isEnabled()) M5.Mic.end();
 }

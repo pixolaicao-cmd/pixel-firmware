@@ -9,6 +9,10 @@
 #include <M5Unified.h>
 #include "config.h"
 
+// 由 player.h 实现 — 这里只前置声明，避免引入 player.h 的依赖链
+extern uint8_t playerGetVolumeLevel();
+extern uint8_t playerGetVolumeMax();
+
 static const int LINE_H = 32;  // 行高（像素），TextSize=2 约 32px
 
 void displayInit() {
@@ -48,9 +52,60 @@ void displayShow(const String& line1,
     displayShow(line1.c_str(), line2.c_str(), line3.c_str());
 }
 
-// 清屏
-void displayReset() {
+// 待机画面：上方显示状态，下方画一个明显的"按住说话"按钮
+// pressing=true 时按钮变红色（录音中）；false 是青色待机色
+void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", bool pressing = false) {
     M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.fillCircle(10, 10, 6, TFT_CYAN);
+
+    if (topLine && strlen(topLine) > 0) {
+        M5.Display.setCursor(24, 4);
+        M5.Display.print(topLine);
+    }
+    if (subLine && strlen(subLine) > 0) {
+        M5.Display.setCursor(4, 4 + LINE_H);
+        M5.Display.print(subLine);
+    }
+
+    // 屏幕中段 (y=80-128) 画 5 段音量条 — 顶部触摸区调音量
+    {
+        const int   bx = 20, by = 84, bw = 280, bh = 32;
+        const uint8_t maxL = playerGetVolumeMax();   // 5
+        const uint8_t curL = playerGetVolumeLevel(); // 0..5
+        // 左侧 "-" / 右侧 "+" 提示
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(0xC618, TFT_BLACK);
+        M5.Display.setCursor(4, by + 8);   M5.Display.print("-");
+        M5.Display.setCursor(308, by + 8); M5.Display.print("+");
+
+        const int gap   = 4;
+        const int segW  = (bw - gap * (maxL - 1)) / maxL;
+        for (uint8_t i = 0; i < maxL; i++) {
+            int sx = bx + i * (segW + gap);
+            uint16_t color = (i < curL) ? 0x05FF /*青蓝*/ : 0x2104 /*暗灰*/;
+            M5.Display.fillRect(sx, by, segW, bh, color);
+            M5.Display.drawRect(sx, by, segW, bh, 0x4208);
+        }
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+
+    // 屏幕下半 (y=140-220) 画按钮
+    const int bx = 20, by = 140, bw = 280, bh = 80;
+    uint16_t btnColor   = pressing ? TFT_RED   : 0x05FF;     // 青蓝色
+    uint16_t textColor  = TFT_WHITE;
+    M5.Display.fillRoundRect(bx, by, bw, bh, 16, btnColor);
+    M5.Display.drawRoundRect(bx, by, bw, bh, 16, TFT_WHITE);
+
+    M5.Display.setTextColor(textColor, btnColor);
+    M5.Display.setTextSize(3);
+    const char* label = pressing ? "RECORDING" : "HOLD TO TALK";
+    int textW = (int)strlen(label) * 18;  // textsize 3 ≈ 18px/char
+    M5.Display.setCursor(bx + (bw - textW) / 2, by + (bh - 24) / 2);
+    M5.Display.print(label);
+    M5.Display.setTextSize(2);  // 复位到默认
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
 // 滚动显示长文字（兼容旧接口）

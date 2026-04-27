@@ -73,7 +73,14 @@ String registerDevice(const String& deviceId) {
     String body;
     serializeJson(req, body);
 
-    String resp = httpPostJson("/api/devices/register", body);
+    // TLS 偶发 fatal_alert — 重试 3 次，间隔 1s
+    String resp;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        resp = httpPostJson("/api/devices/register", body);
+        if (!resp.isEmpty()) break;
+        Serial.printf("[Pair] register attempt %d/3 failed, retrying...\n", attempt);
+        delay(1000);
+    }
     if (resp.isEmpty()) return "";
 
     JsonDocument doc;
@@ -133,13 +140,25 @@ String runPairingFlow(
         return "";
     }
     if (code == "PAIRED") {
-        // 已在服务端绑定但本地 NVS 丢失——重新拿 token（需要用户重新扫码）
-        // 这种情况极少，清空 NVS 重新走流程
-        code = registerDevice(deviceId);  // 刷新配对码
-        if (code.isEmpty() || code == "PAIRED") {
-            if (showError) showError("Re-pair needed");
-            return "";
+        // 已在服务端绑定但本地 NVS 丢失：直接调 status 拉回 device_token
+        Serial.println("[Pair] Server says already paired — fetching token");
+        String resp = httpGetJson(("/api/devices/status/" + deviceId).c_str());
+        if (!resp.isEmpty()) {
+            JsonDocument doc;
+            if (deserializeJson(doc, resp) == DeserializationError::Ok) {
+                String status = doc["status"].as<String>();
+                if (status == "paired") {
+                    String token = doc["device_token"].as<String>();
+                    if (!token.isEmpty()) {
+                        nvsWrite(NVS_TOKEN_KEY, token);
+                        Serial.println("[Pair] Token restored from server.");
+                        return token;
+                    }
+                }
+            }
         }
+        if (showError) showError("Token fetch failed");
+        return "";
     }
 
     Serial.printf("[Pair] Pairing code: %s\n", code.c_str());

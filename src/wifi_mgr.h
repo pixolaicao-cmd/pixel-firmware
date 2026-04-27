@@ -98,21 +98,32 @@ bool connectWiFi() {
 
     displayShow("Connecting...", ssid.c_str());
     Serial.printf("[WiFi] Connecting to %s\n", ssid.c_str());
-    WiFi.begin(ssid.c_str(), password.c_str());
 
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 30) {
-        delay(500);
-        tries++;
+    // 两轮尝试，每轮 30s。第一轮失败先 disconnect 再重 begin —— 路由器
+    // 偶发握手卡死时这能拉回来。仍然失败才 fallback 到 captive portal。
+    for (int round = 1; round <= 2; round++) {
+        WiFi.disconnect(true, true);
+        delay(200);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid.c_str(), password.c_str());
+
+        int tries = 0;
+        while (WiFi.status() != WL_CONNECTED && tries < 60) {
+            delay(500);
+            tries++;
+            if ((tries % 10) == 0) {
+                Serial.printf("[WiFi] still trying... round %d, %ds\n", round, tries / 2);
+            }
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+            displayShow("Connected!", WiFi.localIP().toString().c_str());
+            return true;
+        }
+        Serial.printf("[WiFi] round %d failed, retrying...\n", round);
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        displayShow("Connected!", WiFi.localIP().toString().c_str());
-        return true;
-    }
-
-    Serial.println("[WiFi] Failed, starting AP");
+    Serial.println("[WiFi] All retries failed, starting AP");
     startCaptivePortal();
     return false;
 }

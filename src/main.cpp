@@ -41,6 +41,9 @@ enum class State {
 };
 
 State currentState = State::IDLE;
+// 上次录音实际写入 wavBuf 的字节数（含 WAV header）— PROCESSING 用这个值
+// 而不是 WAV_BUF_SIZE，否则会把整 960KB 上传给 /api/voice 然后 HTTP 0 超时
+static size_t g_wavBytes = 0;
 
 // ---- 翻译模式 ----
 bool translateMode = false;
@@ -70,39 +73,67 @@ void ledBlink(int times, int ms = 100) {
     }
 }
 
-// ---- 按键检测（CoreS3：BtnA 是屏幕下方左侧的电容触摸"屏幕底部"，
-//      实际可用 M5.BtnA / M5.BtnPWR / 整块触摸屏 任一作为 Push-to-Talk）
-// 这里用 BtnA：CoreS3 出厂时屏幕底部 1/3 区域被映射为触摸 BtnA。
-// 留 Serial 'r' 作为开发期备用模拟通道（USB 调试时可不接触屏幕也能录音）。
+// ---- 按键检测（CoreS3：物理 BtnA/B/C 不存在，只有触摸屏 FT6336U）----
+// 读 M5.Touch — 屏幕任何位置被按住即视为 push-to-talk。
+// 留 Serial 'r' 作为开发期备用通道（异步：'r' 切换 hold 状态，再发一次释放）。
 static bool g_btnSimPressed = false;
+
+// HOLD-TO-TALK 按钮在屏幕的实际矩形（与 displayIdle() 里画的位置一致）
+static const int BTN_RECT_X1 = 20,  BTN_RECT_Y1 = 140;
+static const int BTN_RECT_X2 = 300, BTN_RECT_Y2 = 220;
 
 bool isBtnPressed() {
 #if USE_TOUCH_BTN
-    // M5.update() 在 loop() 里每轮调一次，此处直接读最新状态
-    return M5.BtnA.isPressed() || g_btnSimPressed;
+    // M5.update() 在 loop() 里每轮调一次，刷新触摸状态
+    if (g_btnSimPressed) return true;
+    if (M5.Touch.getCount() == 0) return false;
+    auto t = M5.Touch.getDetail(0);
+    // 只把落在 HOLD-TO-TALK 矩形内的触摸算成「按键」 —
+    // 顶部 / 角落留给音量控制
+    return (t.x >= BTN_RECT_X1 && t.x <= BTN_RECT_X2 &&
+            t.y >= BTN_RECT_Y1 && t.y <= BTN_RECT_Y2);
 #else
     return (digitalRead(BTN_PIN) == LOW);
 #endif
 }
 
-bool isBtnReleased() {
-#if USE_TOUCH_BTN
-    return !(M5.BtnA.isPressed() || g_btnSimPressed);
-#else
-    return (digitalRead(BTN_PIN) == HIGH);
-#endif
+// 顶部矩形 (y < 80)：左半边 = 音量减，右半边 = 音量加。
+// 调用方在 IDLE 时每 loop 调一次；内部去抖，单次触按只触发一次。
+void pollVolumeTouch() {
+    static bool wasInZone = false;
+    if (M5.Touch.getCount() == 0) { wasInZone = false; return; }
+    auto t = M5.Touch.getDetail(0);
+    if (t.y >= 80) { wasInZone = false; return; }
+    if (wasInZone) return;          // 还按着同一下，别重复触发
+    wasInZone = true;
+    if (t.x < 160) playerVolumeDown();
+    else           playerVolumeUp();
+    // 重绘 idle 屏幕 — displayIdle 会根据当前 level 自动画出对应的段数
+    displayIdle("Pixel AI", "", false);
 }
 
-// 读取 Serial 模拟指令（'r' 模拟按住按键 2 秒；调试用，硬件按键不工作时备用）
+bool isBtnReleased() {
+    return !isBtnPressed();
+}
+
+// 读取 Serial 模拟指令（异步切换：第一次 'r' 按下，第二次 'r' 释放；
+// 或发 'R'/换行 立即释放）。不再用 delay() 阻塞主循环。
 void pollSerialSim() {
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'r') {
-            g_btnSimPressed = true;
-            Serial.println("[SIM] Button pressed");
-            delay(2000);
-            g_btnSimPressed = false;
-            Serial.println("[SIM] Button released");
+            g_btnSimPressed = !g_btnSimPressed;
+            Serial.printf("[SIM] Button %s\n",
+                          g_btnSimPressed ? "PRESSED (send 'r' again to release)" : "released");
+        } else if (c == 'R' || c == '\n' || c == ' ') {
+            if (g_btnSimPressed) {
+                g_btnSimPressed = false;
+                Serial.println("[SIM] Button released");
+            }
+        } else if (c == '+' || c == '=') {
+            playerVolumeUp();
+        } else if (c == '-' || c == '_') {
+            playerVolumeDown();
         }
     }
 }
@@ -111,18 +142,24 @@ void pollSerialSim() {
 // 配对屏幕回调（保持 pairing.h 与显示解耦）
 // ============================================================
 
+// 把配对码暂存为全局，等待界面也要显示同一个码
+static String s_pairingCode = "";
+
 void showPairingCode(const String& code, int secondsLeft) {
+    s_pairingCode = code;
     char buf[32];
     snprintf(buf, sizeof(buf), "Code: %s", code.c_str());
-    displayShow("Pairing...", buf, "Open Pixel App");
+    displayShow("Pair Pixel", buf, "Open Pixel app");
     Serial.printf("[Pair] Code: %s  (%ds left)\n", code.c_str(), secondsLeft);
 }
 
 void showPairingWaiting(int secondsLeft) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Waiting... %ds", secondsLeft);
-    displayShow("Pairing...", buf, "Enter code in App");
-    // 每隔约 30 秒打一次日志，避免刷屏
+    // 保持配对码可见 —— 不覆盖成 "Waiting..."
+    char codeLine[32];
+    snprintf(codeLine, sizeof(codeLine), "Code: %s", s_pairingCode.c_str());
+    char timeLine[32];
+    snprintf(timeLine, sizeof(timeLine), "Waiting... %ds", secondsLeft);
+    displayShow("Pair Pixel", codeLine, timeLine);
     if (secondsLeft % 30 == 0)
         Serial.printf("[Pair] Still waiting... %ds left\n", secondsLeft);
 }
@@ -177,6 +214,11 @@ void setup() {
         return;
     }
     Serial.println("[Pixel] WiFi OK");
+    // 关 WiFi power save —— 默认开启会把 TCP/TLS 上传从 100+KB/s
+    // 限速到 ~5KB/s。5 秒录音 (160KB) 上传时间从 30s+ 掉到 ~2s。
+    WiFi.setSleep(false);
+    // 让 WiFi/TCP 栈稳一下，避免首发 TLS 握手偶发失败
+    delay(1500);
 
     // 配对流程（若 NVS 已有 token 则立即返回）
     displayShow("Pixel AI", "Checking pairing...");
@@ -192,8 +234,8 @@ void setup() {
                       g_deviceToken.substring(g_deviceToken.length() - 4).c_str());
     }
 
-    displayShow("Pixel AI", "Ready!", "Press 'r' to talk");
-    Serial.println("[Pixel] Ready. Press 'r' in Serial to simulate button.");
+    displayIdle("Pixel AI", "Ready!", false);
+    Serial.println("[Pixel] Ready. Tap & hold screen to talk (or 'r' in Serial).");
 }
 
 // ============================================================
@@ -210,7 +252,17 @@ void loop() {
 
         // ── 待机 ──────────────────────────────────────────────
         case State::IDLE:
+            // 顶部条点击 = 调音量（左减右加），不触发录音
+            pollVolumeTouch();
             if (isBtnPressed()) {
+                // 没 token 就不让进录音 — 否则 voicePipeline 会 NULL deref 崩
+                if (g_deviceToken.isEmpty()) {
+                    displayShow("Not paired", "Restart device", "Pair in app");
+                    Serial.println("[Pixel] Tap ignored — no device token (pairing required)");
+                    delay(2000);
+                    displayIdle("Pixel AI", "Not paired", false);
+                    return;
+                }
                 if (!isWiFiConnected()) {
                     displayShow("No WiFi", "Reconnecting...");
                     connectWiFi();
@@ -221,31 +273,35 @@ void loop() {
                 if (translateMode)
                     displayShow("[Translate]", "Recording...", "Release to send");
                 else
-                    displayShow("Recording...", "Release to send");
+                    displayIdle("Recording", "Release to send", true);
                 Serial.println("[Pixel] Recording...");
             }
             break;
 
         // ── 录音 ──────────────────────────────────────────────
         case State::RECORDING: {
-            uint32_t maxMs = RECORD_MAX_SEC * 1000UL;
-            uint32_t startMs = millis();
-            size_t totalWav = 0;
-
-            while (isBtnPressed() && (millis() - startMs) < maxMs) {
-                size_t sz = recordToBuffer(wavBuf, WAV_BUF_SIZE, 500);
-                if (sz > sizeof(WavHeader)) totalWav = sz;
-                int elapsed = (millis() - startMs) / 1000;
-                char timeBuf[24];
-                snprintf(timeBuf, sizeof(timeBuf), "%ds / %ds", elapsed, RECORD_MAX_SEC);
-                displayShow("Recording...", timeBuf);
-            }
-
-            // 最终截取完整帧
-            totalWav = recordToBuffer(wavBuf, WAV_BUF_SIZE,
-                       max(0UL, maxMs - (millis() - startMs) + 100));
+            // 单次 recordToBuffer 一直录，按键释放（shouldStop=true）就停。
+            // 旧版本是 500ms chunk 循环 + final cut，每次 chunk 覆写 wavBuf，
+            // 最终只剩一小段尾音；并且 chunk 之间 mic_task 会撞上失效 rx queue。
+            size_t totalWav = recordToBuffer(
+                wavBuf, WAV_BUF_SIZE,
+                RECORD_MAX_SEC * 1000UL,
+                /* shouldStop */ []() {
+                    // recordToBuffer 内部不会自己调 M5.update / pollSerialSim,
+                    // 必须在这里手动刷新触摸状态 + serial 'r' 模拟切换
+                    M5.update();
+                    pollSerialSim();
+                    return !isBtnPressed();
+                },
+                /* onTick     */ [](uint32_t elapsedMs) {
+                    char timeBuf[24];
+                    snprintf(timeBuf, sizeof(timeBuf), "%us / %ds",
+                             (unsigned)(elapsedMs / 1000), RECORD_MAX_SEC);
+                    displayShow("Recording...", timeBuf);
+                });
 
             ledOff();
+            g_wavBytes = totalWav;
             Serial.printf("[Pixel] Recorded: %d bytes\n", (int)totalWav);
 
             if (totalWav <= (size_t)(sizeof(WavHeader) + 100)) {
@@ -264,7 +320,7 @@ void loop() {
             // ---- 翻译模式：用分步接口（translate 不走 /api/voice）----
             if (translateMode) {
                 displayShow("[Translate]", "Transcribing...");
-                String transcript = transcribeAudio(wavBuf, WAV_BUF_SIZE, g_deviceToken);
+                String transcript = transcribeAudio(wavBuf, g_wavBytes, g_deviceToken);
                 if (transcript.isEmpty()) {
                     displayShow("ERROR", "Transcribe failed");
                     delay(2000);
@@ -285,7 +341,8 @@ void loop() {
                     break;
                 }
 
-                displayShow("[Translate]", transcript.substring(0, 20).c_str());
+                // 不显示转写正文（同样是中文乱码风险），只显示状态
+                displayShow("[Translate]", "Translating...");
                 String srcLang = detectLang(transcript);
                 TranslateResult tr = translateText(transcript, srcLang, g_deviceToken);
 
@@ -313,7 +370,7 @@ void loop() {
             displayShow("Thinking...", "Please wait");
             Serial.println("[Pixel] Calling voicePipeline...");
 
-            VoiceResult vr = voicePipeline(wavBuf, WAV_BUF_SIZE,
+            VoiceResult vr = voicePipeline(wavBuf, g_wavBytes,
                                            mp3Buf, MP3_BUF_SIZE,
                                            g_deviceToken);
 
@@ -337,10 +394,10 @@ void loop() {
                 // 仍然播放 AI 的回复（通常会确认模式切换）
             }
 
-            // 显示 AI 回复（最多两行，每行 20 字符）
-            String replyLine1 = vr.reply.substring(0, 20);
-            String replyLine2 = vr.reply.length() > 20 ? vr.reply.substring(20, 40) : "";
-            displayShow("Pixel:", replyLine1.c_str(), replyLine2.c_str());
+            // 不显示回复正文（reply 是 URL-encoded UTF-8 中文，
+            // M5 默认字库也不渲染汉字，硬画出来就是一串乱码）。
+            // 改成简单状态标识，让用户知道在说话。
+            displayShow("Pixel", "Speaking...");
 
             // 播放 MP3
             currentState = State::SPEAKING;
@@ -348,7 +405,7 @@ void loop() {
             playMp3Buffer(mp3Buf, vr.mp3Size);
             ledOff();
 
-            displayShow("Pixel AI", "Ready!", "Press 'r' to talk");
+            displayIdle("Pixel AI", "Ready!", false);
             currentState = State::IDLE;
             break;
         }

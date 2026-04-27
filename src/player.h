@@ -93,6 +93,80 @@ private:
 static const size_t PCM_MAX_SAMPLES = 30UL * 24000UL;
 static int16_t* g_pcmBuf = nullptr;
 
+// 音量分 5 档（1–5），0 = 静音。NVS 存档位（uint8_t），映射到 M5.Speaker 的 0–255。
+// 选档对应：0=mute  1=轻  2=中低  3=中  4=中高  5=最大（不爆音上限）
+static const uint8_t SPK_LEVEL_MIN = 0;
+static const uint8_t SPK_LEVEL_MAX = 5;
+static const uint8_t SPK_LEVEL_DEFAULT = 3;
+// 经验值 — 5 档对应 M5.Speaker setVolume 的输入。255 已实测会爆音，停在 220。
+static const uint8_t SPK_LEVEL_TO_RAW[SPK_LEVEL_MAX + 1] = {
+    0, 60, 100, 140, 180, 220
+};
+
+static uint8_t g_speakerLevel = SPK_LEVEL_DEFAULT;
+
+inline uint8_t _levelToRaw(uint8_t level) {
+    if (level > SPK_LEVEL_MAX) level = SPK_LEVEL_MAX;
+    return SPK_LEVEL_TO_RAW[level];
+}
+
+inline void _persistVolume() {
+    Preferences p;
+    p.begin("audio", false);
+    p.putUChar("level", g_speakerLevel);
+    p.end();
+}
+
+inline void _loadVolume() {
+    Preferences p;
+    p.begin("audio", true);
+    // 兼容老版本：以前存的是 "vol"（0–255）；首次读不到 "level" 时按旧 raw 反推一档
+    if (p.isKey("level")) {
+        g_speakerLevel = p.getUChar("level", SPK_LEVEL_DEFAULT);
+    } else if (p.isKey("vol")) {
+        uint8_t oldRaw = p.getUChar("vol", 100);
+        // 找最接近的档位
+        uint8_t best = SPK_LEVEL_DEFAULT;
+        int bestDiff = 9999;
+        for (uint8_t i = 0; i <= SPK_LEVEL_MAX; i++) {
+            int d = (int)oldRaw - (int)SPK_LEVEL_TO_RAW[i];
+            if (d < 0) d = -d;
+            if (d < bestDiff) { bestDiff = d; best = i; }
+        }
+        g_speakerLevel = best;
+    } else {
+        g_speakerLevel = SPK_LEVEL_DEFAULT;
+    }
+    if (g_speakerLevel > SPK_LEVEL_MAX) g_speakerLevel = SPK_LEVEL_MAX;
+    p.end();
+}
+
+inline void _applyVolume() {
+    if (M5.Speaker.isEnabled()) {
+        M5.Speaker.setVolume(_levelToRaw(g_speakerLevel));
+    }
+}
+
+void playerVolumeUp() {
+    if (g_speakerLevel < SPK_LEVEL_MAX) g_speakerLevel++;
+    _persistVolume();
+    _applyVolume();
+    Serial.printf("[SPK] level = %u/%u (raw %u)\n",
+                  g_speakerLevel, SPK_LEVEL_MAX, _levelToRaw(g_speakerLevel));
+}
+
+void playerVolumeDown() {
+    if (g_speakerLevel > SPK_LEVEL_MIN) g_speakerLevel--;
+    _persistVolume();
+    _applyVolume();
+    Serial.printf("[SPK] level = %u/%u (raw %u)\n",
+                  g_speakerLevel, SPK_LEVEL_MAX, _levelToRaw(g_speakerLevel));
+}
+
+uint8_t playerGetVolume()      { return _levelToRaw(g_speakerLevel); }
+uint8_t playerGetVolumeLevel() { return g_speakerLevel; }
+uint8_t playerGetVolumeMax()   { return SPK_LEVEL_MAX; }
+
 void playerInit() {
     // CoreS3 mic/speaker 共享 I2S0，这里只 config 不 begin —
     // 真正 begin 推迟到 playMp3Buffer 入口（先 M5.Mic.end() 让出总线）。
@@ -111,8 +185,10 @@ void playerInit() {
         Serial.println("[SPK] PSRAM alloc for PCM buf FAILED");
         return;
     }
-    Serial.printf("[SPK] config staged (AW88298 — begin on demand), PCM buf %u KB\n",
-                  (unsigned)(PCM_MAX_SAMPLES * sizeof(int16_t) / 1024));
+    _loadVolume();
+    Serial.printf("[SPK] config staged (AW88298 — begin on demand), PCM buf %u KB, level=%u/%u\n",
+                  (unsigned)(PCM_MAX_SAMPLES * sizeof(int16_t) / 1024),
+                  g_speakerLevel, SPK_LEVEL_MAX);
 }
 
 // 从已下载的 MP3 字节缓冲解码并播放（阻塞直到播完）
@@ -127,7 +203,16 @@ void playMp3Buffer(const uint8_t* data, size_t len) {
             Serial.println("[SPK] M5.Speaker.begin() failed — AW88298 not responding");
             return;
         }
-        M5.Speaker.setVolume(160);
+        M5.Speaker.setVolume(_levelToRaw(g_speakerLevel));
+        // AW88298 上电后 ~80ms 才稳定。直接喂数据头部会有「啪」一声爆音。
+        // 喂一段静音让功放进入稳态、自动调谐 DC 偏置，再播真实音频。
+        static int16_t silenceBuf[1200] = {0};   // 50ms @ 24kHz
+        M5.Speaker.playRaw(silenceBuf, 1200, 24000, false, 1, -1);
+        while (M5.Speaker.isPlaying()) { delay(2); }
+        delay(30);
+    } else {
+        // 之前已经在播，跨 MP3 也同步当前音量
+        M5.Speaker.setVolume(_levelToRaw(g_speakerLevel));
     }
 
     // 1. 解码 MP3 → PCM 暂存到 PSRAM
