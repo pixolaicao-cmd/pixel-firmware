@@ -23,7 +23,7 @@
 class PCMCaptureSink : public AudioOutput {
 public:
     PCMCaptureSink(int16_t* buf, size_t maxSamples)
-        : _buf(buf), _max(maxSamples) {}
+        : _buf(buf), _capacity(maxSamples) {}
 
     bool SetRate(int hz) override {
         _hertz = hz;
@@ -39,7 +39,7 @@ public:
         return true;
     }
     bool ConsumeSample(int16_t sample[2]) override {
-        if (_pos >= _max) return false;
+        if (_pos >= _capacity) return false;
         // mp3 双声道 → 取均值降为 mono；mono 直接拿 sample[0]
         int16_t s = (_channels == 2)
                     ? static_cast<int16_t>(((int32_t)sample[0] + sample[1]) / 2)
@@ -55,7 +55,7 @@ public:
 
 private:
     int16_t* _buf;
-    size_t   _max;
+    size_t   _capacity;
     size_t   _pos     = 0;
     int      _hertz   = 22050;
     int      _channels = 1;

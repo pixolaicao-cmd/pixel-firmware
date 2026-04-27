@@ -50,11 +50,8 @@ String getDeviceId() {
     return id;
 }
 
-// ── HTTP 工具（引用 api.h 中的 httpPostJson / httpGetJson） ──
-// 在 api.h 中定义，这里直接调用
-
-extern String httpPostJson(const char* path, const String& body, int timeoutMs = HTTP_TIMEOUT_MS);
-extern String httpGetJson(const char* path, const String& deviceToken = "");
+// ── HTTP 工具：直接用 api.h 提供的 httpPostJson / httpGetJson
+// （main.cpp 必须先 #include "api.h" 再 #include "pairing.h"）
 
 // ── 配对流程 ─────────────────────────────────────────────────
 
@@ -152,8 +149,12 @@ String runPairingFlow(
     if (showCode) showCode(code, remaining);
 
     // 4. 轮询后端
-    String token = waitForPairing(deviceId, [&](int sec) {
-        if (showWaiting) showWaiting(sec);
+    // 注意：waitForPairing 期待普通函数指针，捕获 lambda 无法转换。
+    // 用 file-static 跳板把 showWaiting 暴露给 waitForPairing 的回调。
+    static void (*s_showWaiting)(int) = nullptr;
+    s_showWaiting = showWaiting;
+    String token = waitForPairing(deviceId, [](int sec) {
+        if (s_showWaiting) s_showWaiting(sec);
     });
 
     if (token.isEmpty()) {

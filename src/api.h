@@ -216,10 +216,14 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
             int sp = line.indexOf(' ');
             if (sp > 0) statusCode = line.substring(sp + 1, sp + 4).toInt();
         }
-        if (line.startsWith("X-Transcript:"))
-            result.transcript = line.substring(13).trim();
-        if (line.startsWith("X-Reply:"))
-            result.reply = line.substring(8).trim();
+        if (line.startsWith("X-Transcript:")) {
+            result.transcript = line.substring(13);
+            result.transcript.trim();
+        }
+        if (line.startsWith("X-Reply:")) {
+            result.reply = line.substring(8);
+            result.reply.trim();
+        }
         if (line.length() == 0) break;  // headers 结束
     }
 
