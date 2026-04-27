@@ -35,8 +35,9 @@ struct WavHeader {
 static const size_t MIC_CHUNK_SAMPLES = 256;
 
 void recorderInit() {
-    // M5.begin() 已在 setup() 里调用，电源/I2C 都准备好了。
-    // 这里只需要点亮 mic 子系统（ES7210 + 内部 I2S）。
+    // CoreS3 的 mic/speaker 共享 I2S0 — 不能同时 begin。
+    // 这里只把 config 挂上去，真正 begin 在 recordToBuffer 入口完成
+    // （并且会先 M5.Speaker.end() 让出总线）。
     auto cfg = M5.Mic.config();
     cfg.sample_rate     = SAMPLE_RATE;     // 16000
     cfg.stereo          = false;
@@ -46,12 +47,8 @@ void recorderInit() {
     cfg.task_priority   = 2;
     cfg.task_pinned_core = -1;
     M5.Mic.config(cfg);
-
-    if (!M5.Mic.begin()) {
-        Serial.println("[MIC] M5.Mic.begin() FAILED — ES7210 codec not responding");
-        return;
-    }
-    Serial.printf("[MIC] M5.Mic ready (ES7210, %d Hz mono)\n", SAMPLE_RATE);
+    Serial.printf("[MIC] config staged (ES7210, %d Hz mono — begin on demand)\n",
+                  SAMPLE_RATE);
 }
 
 /**
@@ -63,10 +60,12 @@ void recorderInit() {
  */
 size_t recordToBuffer(uint8_t* outBuf, size_t outBufSize, uint32_t maxMs) {
     if (!outBuf || outBufSize <= sizeof(WavHeader)) return 0;
+
+    // I2S 切换：让出 Speaker（如果之前在用），再拿 Mic
+    if (M5.Speaker.isEnabled()) M5.Speaker.end();
     if (!M5.Mic.isEnabled()) {
-        // 罕见情况：之前被 Speaker 抢占（共享 I2S 总线），重新拿回
         if (!M5.Mic.begin()) {
-            Serial.println("[MIC] re-enable failed");
+            Serial.println("[MIC] M5.Mic.begin() failed — ES7210 not responding");
             return 0;
         }
     }

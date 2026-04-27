@@ -94,6 +94,8 @@ static const size_t PCM_MAX_SAMPLES = 30UL * 24000UL;
 static int16_t* g_pcmBuf = nullptr;
 
 void playerInit() {
+    // CoreS3 mic/speaker 共享 I2S0，这里只 config 不 begin —
+    // 真正 begin 推迟到 playMp3Buffer 入口（先 M5.Mic.end() 让出总线）。
     auto cfg = M5.Speaker.config();
     cfg.sample_rate     = 24000;     // 仅作默认；playRaw 会按实际 MP3 速率覆盖
     cfg.stereo          = false;
@@ -104,18 +106,12 @@ void playerInit() {
     cfg.use_dac         = false;     // CoreS3 不走内置 DAC，走 AW88298 I2S
     M5.Speaker.config(cfg);
 
-    if (!M5.Speaker.begin()) {
-        Serial.println("[SPK] M5.Speaker.begin() FAILED — AW88298 not responding");
-        return;
-    }
-    M5.Speaker.setVolume(160);  // 0~255；160 ≈ 中等偏大，避免初次太轻听不见
-
     g_pcmBuf = (int16_t*)ps_malloc(PCM_MAX_SAMPLES * sizeof(int16_t));
     if (!g_pcmBuf) {
         Serial.println("[SPK] PSRAM alloc for PCM buf FAILED");
         return;
     }
-    Serial.printf("[SPK] M5.Speaker ready (AW88298), PCM buf %u KB\n",
+    Serial.printf("[SPK] config staged (AW88298 — begin on demand), PCM buf %u KB\n",
                   (unsigned)(PCM_MAX_SAMPLES * sizeof(int16_t) / 1024));
 }
 
@@ -123,6 +119,16 @@ void playerInit() {
 void playMp3Buffer(const uint8_t* data, size_t len) {
     if (!data || len == 0 || !g_pcmBuf) return;
     Serial.printf("[SPK] Decoding MP3 %u bytes...\n", (unsigned)len);
+
+    // I2S 切换：让出 Mic（如果之前在用），再拿 Speaker
+    if (M5.Mic.isEnabled()) M5.Mic.end();
+    if (!M5.Speaker.isEnabled()) {
+        if (!M5.Speaker.begin()) {
+            Serial.println("[SPK] M5.Speaker.begin() failed — AW88298 not responding");
+            return;
+        }
+        M5.Speaker.setVolume(160);
+    }
 
     // 1. 解码 MP3 → PCM 暂存到 PSRAM
     auto* src    = new AudioFileSourceMemory(data, len);
