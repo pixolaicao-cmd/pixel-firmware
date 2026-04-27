@@ -70,14 +70,16 @@ void ledBlink(int times, int ms = 100) {
     }
 }
 
-// ---- 按键检测（硬件到货前用 Serial 'r' 模拟）----
-// 到货后替换为：M5.update(); return M5.BtnA.isPressed();
+// ---- 按键检测（CoreS3：BtnA 是屏幕下方左侧的电容触摸"屏幕底部"，
+//      实际可用 M5.BtnA / M5.BtnPWR / 整块触摸屏 任一作为 Push-to-Talk）
+// 这里用 BtnA：CoreS3 出厂时屏幕底部 1/3 区域被映射为触摸 BtnA。
+// 留 Serial 'r' 作为开发期备用模拟通道（USB 调试时可不接触屏幕也能录音）。
 static bool g_btnSimPressed = false;
 
 bool isBtnPressed() {
 #if USE_TOUCH_BTN
-    // TODO: 硬件到货后改为 M5.BtnA.isPressed()
-    return g_btnSimPressed;
+    // M5.update() 在 loop() 里每轮调一次，此处直接读最新状态
+    return M5.BtnA.isPressed() || g_btnSimPressed;
 #else
     return (digitalRead(BTN_PIN) == LOW);
 #endif
@@ -85,20 +87,19 @@ bool isBtnPressed() {
 
 bool isBtnReleased() {
 #if USE_TOUCH_BTN
-    return !g_btnSimPressed;
+    return !(M5.BtnA.isPressed() || g_btnSimPressed);
 #else
     return (digitalRead(BTN_PIN) == HIGH);
 #endif
 }
 
-// 读取 Serial 模拟指令（'r' 模拟按住按键）
+// 读取 Serial 模拟指令（'r' 模拟按住按键 2 秒；调试用，硬件按键不工作时备用）
 void pollSerialSim() {
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'r') {
             g_btnSimPressed = true;
             Serial.println("[SIM] Button pressed");
-            // 自动在 2 秒后松开（模拟按住录音）
             delay(2000);
             g_btnSimPressed = false;
             Serial.println("[SIM] Button released");
@@ -200,7 +201,9 @@ void setup() {
 // ============================================================
 
 void loop() {
-    // 读 Serial 模拟按键
+    // 必须每轮调一次：刷新 M5.BtnA / 触摸 / IMU 等内部状态
+    M5.update();
+    // 读 Serial 模拟按键（调试用备用通道）
     pollSerialSim();
 
     switch (currentState) {
