@@ -1,11 +1,13 @@
 #pragma once
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include "display.h"
 
 Preferences prefs;
-WebServer apServer(80);
+WebServer  apServer(80);
+DNSServer  dnsServer;
 
 // 从 flash 读取保存的 WiFi 凭据
 bool loadWiFiCreds(String& ssid, String& password) {
@@ -23,69 +25,241 @@ void saveWiFiCreds(const String& ssid, const String& password) {
     prefs.end();
 }
 
-// 配网热点页面
+// ── 配网页面 ────────────────────────────────────────────────────
+// 进入页面立即调 /scan 拿附近 WiFi 列表，点击 SSID 就填进表单
 const char* CONFIG_PAGE = R"HTML(
 <!DOCTYPE html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pixel Setup</title>
 <style>
-  body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px}
-  h2{color:#333}input,button{width:100%;padding:12px;margin:8px 0;box-sizing:border-box;border-radius:8px;border:1px solid #ccc;font-size:16px}
-  button{background:#000;color:#fff;border:none;cursor:pointer}
-  button:hover{background:#333}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:420px;margin:0 auto;padding:20px;background:#fafafa;color:#222}
+  h2{margin:0 0 4px;font-size:24px}
+  .sub{color:#666;font-size:14px;margin-bottom:20px}
+  .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
+  .card h3{margin:0 0 12px;font-size:15px;color:#444;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .net{display:flex;justify-content:space-between;align-items:center;padding:12px 8px;border-bottom:1px solid #eee;cursor:pointer;transition:background 0.1s}
+  .net:last-child{border-bottom:none}
+  .net:hover,.net.sel{background:#f0f7ff}
+  .net.sel{font-weight:600}
+  .ssid{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:8px}
+  .rssi{color:#888;font-size:13px}
+  .lock{color:#888;font-size:13px;margin-left:6px}
+  input,button{width:100%;padding:14px;margin:6px 0;border-radius:10px;border:1px solid #ddd;font-size:16px;background:#fff}
+  input:focus{outline:none;border-color:#0a84ff}
+  button{background:#0a84ff;color:#fff;border:none;cursor:pointer;font-weight:600;margin-top:12px}
+  button:active{background:#0670d8}
+  button.refresh{background:transparent;color:#0a84ff;border:1px solid #0a84ff;padding:6px 14px;width:auto;font-size:13px;margin:0}
+  .empty{color:#999;text-align:center;padding:24px 0;font-size:14px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid #ddd;border-top-color:#0a84ff;border-radius:50%;animation:s 0.7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes s{to{transform:rotate(360deg)}}
 </style>
 </head><body>
 <h2>🪄 Pixel Setup</h2>
-<p>Connect Pixel to your WiFi network.</p>
-<form action="/save" method="POST">
-  <input name="ssid"     placeholder="WiFi Name (SSID)"     required>
-  <input name="password" placeholder="WiFi Password" type="password">
-  <button type="submit">Connect</button>
+<div class="sub">Pick your WiFi network</div>
+
+<div class="card">
+  <h3>
+    <span>Networks nearby</span>
+    <button class="refresh" id="refreshBtn" type="button" onclick="scan()">Refresh</button>
+  </h3>
+  <div id="list"><div class="empty"><span class="spin"></span>Scanning…</div></div>
+</div>
+
+<form action="/save" method="POST" id="form">
+  <div class="card">
+    <h3>Connect</h3>
+    <input id="ssid" name="ssid" placeholder="WiFi name (or pick above)" required autocapitalize="off" autocorrect="off" spellcheck="false">
+    <input id="pass" name="password" type="password" placeholder="Password (leave empty if open)">
+    <button type="submit">Connect</button>
+  </div>
 </form>
+
+<script>
+function pickSsid(name, secured) {
+  document.getElementById('ssid').value = name;
+  document.querySelectorAll('.net').forEach(n => n.classList.remove('sel'));
+  event.currentTarget.classList.add('sel');
+  if (secured) document.getElementById('pass').focus();
+}
+function rssiBars(rssi) {
+  if (rssi >= -55) return '▮▮▮▮';
+  if (rssi >= -65) return '▮▮▮▯';
+  if (rssi >= -75) return '▮▮▯▯';
+  return '▮▯▯▯';
+}
+function render(nets) {
+  var list = document.getElementById('list');
+  if (!nets || !nets.length) {
+    list.innerHTML = '<div class="empty">No networks found. Tap Refresh.</div>';
+    return;
+  }
+  list.innerHTML = nets.map(function(n){
+    var lock = n.s ? '🔒' : '';
+    return '<div class="net" onclick="pickSsid(\'' +
+      n.n.replace(/'/g, "\\'") + '\',' + (n.s?1:0) + ')">' +
+      '<span class="ssid">' + n.n.replace(/</g,'&lt;') + '</span>' +
+      '<span class="rssi">' + rssiBars(n.r) + '</span>' +
+      '<span class="lock">' + lock + '</span></div>';
+  }).join('');
+}
+async function scan() {
+  var btn = document.getElementById('refreshBtn');
+  btn.disabled = true; btn.textContent = 'Scanning…';
+  document.getElementById('list').innerHTML = '<div class="empty"><span class="spin"></span>Scanning…</div>';
+  try {
+    var r = await fetch('/scan', {cache:'no-store'});
+    var data = await r.json();
+    render(data.networks || []);
+  } catch(e) {
+    document.getElementById('list').innerHTML = '<div class="empty">Scan failed. Try again.</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Refresh';
+  }
+}
+scan();
+</script>
 </body></html>
 )HTML";
 
 const char* SUCCESS_PAGE = R"HTML(
-<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:400px;margin:40px auto;padding:20px">
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Saved</title>
+<style>body{font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;padding:24px;text-align:center}
+h2{font-size:32px;margin:0 0 12px}p{color:#555;line-height:1.5}</style>
+</head><body>
 <h2>✅ Saved!</h2>
-<p>Pixel will now connect to your WiFi. You can close this page.</p>
+<p>Pixel will restart and connect to your WiFi.<br>You can close this page.</p>
 </body></html>
 )HTML";
 
-void startCaptivePortal() {
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    displayShow("WiFi Setup", "Connect to:", AP_SSID);
-    Serial.printf("[WiFi] AP started: %s  IP: %s\n", AP_SSID, AP_IP);
+// ── /scan：回 JSON 附近 WiFi 列表（按信号强度排序、去重、limit 20）─
+String _scanNetworksJson() {
+    int n = WiFi.scanNetworks(false /*async*/, true /*hidden*/);
+    if (n < 0) n = 0;
 
+    // 按 RSSI 排序索引
+    int order[40];
+    int total = (n > 40) ? 40 : n;
+    for (int i = 0; i < total; i++) order[i] = i;
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - 1 - i; j++) {
+            if (WiFi.RSSI(order[j]) < WiFi.RSSI(order[j + 1])) {
+                int t = order[j]; order[j] = order[j + 1]; order[j + 1] = t;
+            }
+        }
+    }
+
+    // 去重 SSID（同一 SSID 只留信号最强那个）+ 取前 20
+    String json = "{\"networks\":[";
+    String seen = "|";
+    int kept = 0;
+    for (int idx = 0; idx < total && kept < 20; idx++) {
+        int i = order[idx];
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) continue;
+        String key = "|" + ssid + "|";
+        if (seen.indexOf(key) >= 0) continue;
+        seen += ssid + "|";
+
+        // JSON 转义
+        String esc;
+        for (size_t k = 0; k < ssid.length(); k++) {
+            char c = ssid[k];
+            if (c == '"' || c == '\\') { esc += '\\'; esc += c; }
+            else if (c == '\n') esc += "\\n";
+            else if ((uint8_t)c < 0x20) ;  // skip control
+            else esc += c;
+        }
+
+        bool secured = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+        if (kept > 0) json += ",";
+        json += "{\"n\":\"" + esc + "\",\"r\":" + String(WiFi.RSSI(i))
+              + ",\"s\":" + (secured ? "1" : "0") + "}";
+        kept++;
+    }
+    json += "]}";
+    WiFi.scanDelete();
+    return json;
+}
+
+void startCaptivePortal() {
+    // 1. 启 AP
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    delay(100);
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[WiFi] AP started: %s  IP: %s\n", AP_SSID, apIP.toString().c_str());
+    displayShow("WiFi Setup", "Join WiFi:", AP_SSID);
+
+    // 2. DNS 全域名劫持 → 任何域名都解析回 192.168.4.1
+    //    这是触发手机"自动弹出登录页"的关键 — 没有这一步只能让用户手动输 IP
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(53, "*", apIP);
+
+    // 3. 真正的配置页
     apServer.on("/", HTTP_GET, []() {
+        apServer.sendHeader("Cache-Control", "no-store");
         apServer.send(200, "text/html", CONFIG_PAGE);
+    });
+
+    apServer.on("/scan", HTTP_GET, []() {
+        String json = _scanNetworksJson();
+        apServer.sendHeader("Cache-Control", "no-store");
+        apServer.send(200, "application/json", json);
     });
 
     apServer.on("/save", HTTP_POST, []() {
         String ssid = apServer.arg("ssid");
         String pass = apServer.arg("password");
+        if (ssid.length() == 0) {
+            apServer.send(400, "text/plain", "SSID required");
+            return;
+        }
         saveWiFiCreds(ssid, pass);
         apServer.send(200, "text/html", SUCCESS_PAGE);
-        delay(1000);
+        Serial.printf("[WiFi] Saved creds for SSID: %s — restarting\n", ssid.c_str());
+        delay(1500);
         ESP.restart();
     });
 
-    // Captive portal：把所有请求重定向到配置页
+    // 4. iOS / macOS captive 探测路径 — 必须返回 200 + 非苹果 success 标记，
+    //    OS 才认定"需要登录"并自动弹页面
+    auto handleCaptive = []() {
+        apServer.sendHeader("Location", "http://192.168.4.1/", true);
+        apServer.send(302, "text/plain", "");
+    };
+    // iOS/macOS:
+    apServer.on("/hotspot-detect.html", HTTP_GET, handleCaptive);
+    apServer.on("/library/test/success.html", HTTP_GET, handleCaptive);
+    // Android (Chromium):
+    apServer.on("/generate_204",  HTTP_GET, handleCaptive);
+    apServer.on("/gen_204",       HTTP_GET, handleCaptive);
+    // Windows:
+    apServer.on("/connecttest.txt", HTTP_GET, handleCaptive);
+    apServer.on("/ncsi.txt",         HTTP_GET, handleCaptive);
+    apServer.on("/redirect",         HTTP_GET, handleCaptive);
+
+    // 5. 兜底：所有其他请求重定向到根
     apServer.onNotFound([]() {
-        apServer.sendHeader("Location", "http://192.168.4.1/");
+        apServer.sendHeader("Location", "http://192.168.4.1/", true);
         apServer.send(302, "text/plain", "");
     });
 
     apServer.begin();
-    displayShow("WiFi Setup", "Open browser:", AP_IP);
+    displayShow("WiFi Setup", "Join: " AP_SSID, "Page opens automatically");
 
-    // 等待用户配置（最多 5 分钟）
+    // 6. 服务循环（最多 5 分钟，期间 dnsServer + apServer 都得喂）
     unsigned long start = millis();
     while (millis() - start < 300000) {
+        dnsServer.processNextRequest();
         apServer.handleClient();
-        delay(10);
+        delay(2);
     }
+    // 超时退出（dnsServer.stop 由 ESP.restart 之前的析构处理）
 }
 
 bool connectWiFi() {
