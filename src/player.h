@@ -191,8 +191,12 @@ void playerInit() {
                   g_speakerLevel, SPK_LEVEL_MAX);
 }
 
+// 播放期每帧回调 — 让 UI 层能在 isPlaying() 等待循环里画动画
+typedef void (*PlaybackTickCb)(uint32_t elapsedMs);
+
 // 从已下载的 MP3 字节缓冲解码并播放（阻塞直到播完）
-void playMp3Buffer(const uint8_t* data, size_t len) {
+// tick 可选：每 ~80ms 调一次，传入从 playRaw 入队后经过的毫秒
+void playMp3Buffer(const uint8_t* data, size_t len, PlaybackTickCb tick = nullptr) {
     if (!data || len == 0 || !g_pcmBuf) return;
     Serial.printf("[SPK] Decoding MP3 %u bytes...\n", (unsigned)len);
 
@@ -254,7 +258,16 @@ void playMp3Buffer(const uint8_t* data, size_t len) {
         Serial.println("[SPK] playRaw queue rejected");
         return;
     }
+    uint32_t startMs = millis();
+    uint32_t lastFrameMs = 0;
     while (M5.Speaker.isPlaying()) {
+        if (tick) {
+            uint32_t now = millis();
+            if (now - lastFrameMs >= 80) {
+                tick(now - startMs);
+                lastFrameMs = now;
+            }
+        }
         delay(10);
     }
     Serial.println("[SPK] Playback done");

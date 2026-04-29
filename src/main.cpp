@@ -322,7 +322,12 @@ void loop() {
                     displayShow("Pixel AI", "Chat mode", "Ready!");
                     size_t sz = speakText("好的，退出翻译模式。", "zh",
                                           mp3Buf, MP3_BUF_SIZE, g_deviceToken);
-                    if (sz > 0) { ledOn(); playMp3Buffer(mp3Buf, sz); ledOff(); }
+                    if (sz > 0) {
+                        displaySpeakingInit();
+                        ledOn();
+                        playMp3Buffer(mp3Buf, sz, displaySpeakingTick);
+                        ledOff();
+                    }
                     currentState = State::IDLE;
                     break;
                 }
@@ -345,7 +350,12 @@ void loop() {
 
                 size_t mp3Sz = speakText(tr.text, tr.targetLang,
                                           mp3Buf, MP3_BUF_SIZE, g_deviceToken);
-                if (mp3Sz > 0) { ledOn(); playMp3Buffer(mp3Buf, mp3Sz); ledOff(); }
+                if (mp3Sz > 0) {
+                    displaySpeakingInit();
+                    ledOn();
+                    playMp3Buffer(mp3Buf, mp3Sz, displaySpeakingTick);
+                    ledOff();
+                }
 
                 displayShow("[Translate]", "Ready!", "Say anything");
                 currentState = State::IDLE;
@@ -382,13 +392,13 @@ void loop() {
 
             // 不显示回复正文（reply 是 URL-encoded UTF-8 中文，
             // M5 默认字库也不渲染汉字，硬画出来就是一串乱码）。
-            // 改成简单状态标识，让用户知道在说话。
-            displayShow("Pixel", "Speaking...");
+            // 改成动画 Pixel 脸 + 嘴巴跟着说话节奏开合。
+            displaySpeakingInit();
 
-            // 播放 MP3
+            // 播放 MP3，每帧动画嘴巴
             currentState = State::SPEAKING;
             ledOn();
-            playMp3Buffer(mp3Buf, vr.mp3Size);
+            playMp3Buffer(mp3Buf, vr.mp3Size, displaySpeakingTick);
             ledOff();
 
             displayIdle("Pixel AI", "Ready!", false);
