@@ -88,8 +88,7 @@ bool isBtnPressed() {
     if (g_btnSimPressed) return true;
     if (M5.Touch.getCount() == 0) return false;
     auto t = M5.Touch.getDetail(0);
-    // 只把落在 HOLD-TO-TALK 矩形内的触摸算成「按键」 —
-    // 顶部 / 角落留给音量控制
+    // 只把落在 HOLD-TO-TALK 矩形内的触摸算成「按键」
     return (t.x >= BTN_RECT_X1 && t.x <= BTN_RECT_X2 &&
             t.y >= BTN_RECT_Y1 && t.y <= BTN_RECT_Y2);
 #else
@@ -97,20 +96,9 @@ bool isBtnPressed() {
 #endif
 }
 
-// 顶部矩形 (y < 80)：左半边 = 音量减，右半边 = 音量加。
-// 调用方在 IDLE 时每 loop 调一次；内部去抖，单次触按只触发一次。
-void pollVolumeTouch() {
-    static bool wasInZone = false;
-    if (M5.Touch.getCount() == 0) { wasInZone = false; return; }
-    auto t = M5.Touch.getDetail(0);
-    if (t.y >= 80) { wasInZone = false; return; }
-    if (wasInZone) return;          // 还按着同一下，别重复触发
-    wasInZone = true;
-    if (t.x < 160) playerVolumeDown();
-    else           playerVolumeUp();
-    // 重绘 idle 屏幕 — displayIdle 会根据当前 level 自动画出对应的段数
-    displayIdle("Pixel AI", "", false);
-}
+// 注：顶部触摸调音量已移除 — IDLE 状态 M5.Speaker 没 begin，setVolume 不生效，
+// 用户按了没反馈很迷惑。改成中段画 Pixel 表情。音量调节保留：Serial 发 +/- 仍可调，
+// 后续可用语音指令"大声点 / 小声点"控制。
 
 bool isBtnReleased() {
     return !isBtnPressed();
@@ -252,8 +240,6 @@ void loop() {
 
         // ── 待机 ──────────────────────────────────────────────
         case State::IDLE:
-            // 顶部条点击 = 调音量（左减右加），不触发录音
-            pollVolumeTouch();
             if (isBtnPressed()) {
                 // 没 token 就不让进录音 — 否则 voicePipeline 会 NULL deref 崩
                 if (g_deviceToken.isEmpty()) {

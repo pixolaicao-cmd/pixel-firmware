@@ -9,11 +9,41 @@
 #include <M5Unified.h>
 #include "config.h"
 
-// 由 player.h 实现 — 这里只前置声明，避免引入 player.h 的依赖链
-extern uint8_t playerGetVolumeLevel();
-extern uint8_t playerGetVolumeMax();
-
 static const int LINE_H = 32;  // 行高（像素），TextSize=2 约 32px
+
+// ── Pixel 表情：在 idle 屏中段画一个可爱的小脸，替换无效的音量条
+// 状态：idle = 微笑；listening = "o"嘴；可后续扩展为 thinking / sleeping
+// 单纯用基本图元，避免依赖 emoji 字库
+static inline void drawPixelFace(int cx, int cy, bool listening) {
+    // 脸部圆背景
+    M5.Display.fillCircle(cx, cy, 38, 0x05FF /*青蓝*/);
+    M5.Display.drawCircle(cx, cy, 38, TFT_WHITE);
+
+    // 两只眼
+    int eyeY = cy - 6;
+    int eyeOffsetX = 14;
+    int eyeR = 5;
+    M5.Display.fillCircle(cx - eyeOffsetX, eyeY, eyeR, TFT_BLACK);
+    M5.Display.fillCircle(cx + eyeOffsetX, eyeY, eyeR, TFT_BLACK);
+    // 高光
+    M5.Display.fillCircle(cx - eyeOffsetX + 1, eyeY - 1, 1, TFT_WHITE);
+    M5.Display.fillCircle(cx + eyeOffsetX + 1, eyeY - 1, 1, TFT_WHITE);
+
+    // 嘴
+    if (listening) {
+        // "o" 形 — 表示正在听
+        M5.Display.drawCircle(cx, cy + 14, 5, TFT_BLACK);
+        M5.Display.drawCircle(cx, cy + 14, 6, TFT_BLACK);
+    } else {
+        // 微笑曲线 — 用抛物线点阵近似画粗弧
+        for (int i = -12; i <= 12; i++) {
+            int x = cx + i;
+            int y = cy + 12 + (i * i) / 18;  // 向上微弯成笑
+            M5.Display.drawPixel(x, y, TFT_BLACK);
+            M5.Display.drawPixel(x, y + 1, TFT_BLACK);
+        }
+    }
+}
 
 void displayInit() {
     // M5.begin() 已在 setup() 中调用；这里只设置初始样式
@@ -69,27 +99,9 @@ void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", boo
         M5.Display.print(subLine);
     }
 
-    // 屏幕中段 (y=80-128) 画 5 段音量条 — 顶部触摸区调音量
-    {
-        const int   bx = 20, by = 84, bw = 280, bh = 32;
-        const uint8_t maxL = playerGetVolumeMax();   // 5
-        const uint8_t curL = playerGetVolumeLevel(); // 0..5
-        // 左侧 "-" / 右侧 "+" 提示
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(0xC618, TFT_BLACK);
-        M5.Display.setCursor(4, by + 8);   M5.Display.print("-");
-        M5.Display.setCursor(308, by + 8); M5.Display.print("+");
-
-        const int gap   = 4;
-        const int segW  = (bw - gap * (maxL - 1)) / maxL;
-        for (uint8_t i = 0; i < maxL; i++) {
-            int sx = bx + i * (segW + gap);
-            uint16_t color = (i < curL) ? 0x05FF /*青蓝*/ : 0x2104 /*暗灰*/;
-            M5.Display.fillRect(sx, by, segW, bh, color);
-            M5.Display.drawRect(sx, by, segW, bh, 0x4208);
-        }
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    }
+    // 屏幕中段 (y≈80-130) 画 Pixel 表情
+    // pressing=true 视为正在听，画 "o" 形嘴；否则画微笑
+    drawPixelFace(160, 100, pressing);
 
     // 屏幕下半 (y=140-220) 画按钮
     const int bx = 20, by = 140, bw = 280, bh = 80;
