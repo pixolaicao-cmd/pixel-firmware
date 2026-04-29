@@ -22,9 +22,11 @@
 #define NVS_DEVICE_ID_KEY "device_id"
 
 // --- WiFi 配网热点（设备未连过网时启动） ---
-#define AP_SSID     "Pixel-Setup"
-#define AP_PASSWORD "pixel123"
-#define AP_IP       "192.168.4.1"
+// SSID 也带 MAC 后缀 → 同一空间多台 Pixel 不会撞名
+// 密码每台设备唯一（运行时由 MAC 后 3 字节生成，见 wifi_mgr.h:apPassword()）
+// 旧的硬编码 "pixel123" 已下线 —— 公开仓库 + 全设备同密码 = 任何人都能蹭网
+#define AP_SSID_PREFIX "Pixel-"
+#define AP_IP          "192.168.4.1"
 
 // ============================================================
 // M5Stack CoreS3 硬件（内置，无需外接）

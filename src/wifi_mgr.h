@@ -9,6 +9,26 @@ Preferences prefs;
 WebServer  apServer(80);
 DNSServer  dnsServer;
 
+// 从 AP MAC 派生 SSID + 密码 — 每台设备独立
+// MAC 取 AP 模式的，6 字节稳定（出厂烧死，不会随 STA 漂）
+static void _macSuffix(char out[7]) {
+    uint8_t mac[6];
+    WiFi.softAPmacAddress(mac);
+    snprintf(out, 7, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+}
+
+String apSsid() {
+    char suf[7]; _macSuffix(suf);
+    return String(AP_SSID_PREFIX) + suf;   // e.g. "Pixel-A1B2C3"
+}
+
+// WPA2 密码至少 8 字符。"pixel-" + 6 hex = 12 字符，OK。
+// 密码不是机密 — 它打印在 LCD 上给当面用户看；目的是防"路过的陌生人蹭网"
+String apPassword() {
+    char suf[7]; _macSuffix(suf);
+    return String("pixel-") + suf;          // e.g. "pixel-A1B2C3"
+}
+
 // 从 flash 读取保存的 WiFi 凭据
 bool loadWiFiCreds(String& ssid, String& password) {
     prefs.begin("wifi", true);
@@ -187,13 +207,17 @@ String _scanNetworksJson() {
 }
 
 void startCaptivePortal() {
-    // 1. 启 AP
+    // 1. 启 AP — SSID 和密码都从 MAC 派生（每台设备唯一）
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    String ssid = apSsid();
+    String pass = apPassword();
+    WiFi.softAP(ssid.c_str(), pass.c_str());
     delay(100);
     IPAddress apIP = WiFi.softAPIP();
-    Serial.printf("[WiFi] AP started: %s  IP: %s\n", AP_SSID, apIP.toString().c_str());
-    displayShow("WiFi Setup", "Join WiFi:", AP_SSID);
+    Serial.printf("[WiFi] AP started: %s (pwd: %s)  IP: %s\n",
+                  ssid.c_str(), pass.c_str(), apIP.toString().c_str());
+    // 屏幕同时显示 SSID + 密码 — 用户当面看着抄
+    displayShow(ssid.c_str(), "Password:", pass.c_str());
 
     // 2. DNS 全域名劫持 → 任何域名都解析回 192.168.4.1
     //    这是触发手机"自动弹出登录页"的关键 — 没有这一步只能让用户手动输 IP
@@ -250,7 +274,8 @@ void startCaptivePortal() {
     });
 
     apServer.begin();
-    displayShow("WiFi Setup", "Join: " AP_SSID, "Page opens automatically");
+    // 配网状态保持 SSID/密码可见 — 用户连上前要看着抄
+    // (captive portal 弹页面后用户也只需点选 → 不必再切屏)
 
     // 6. 服务循环（最多 5 分钟，期间 dnsServer + apServer 都得喂）
     unsigned long start = millis();
