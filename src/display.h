@@ -11,36 +11,43 @@
 
 static const int LINE_H = 32;  // 行高（像素），TextSize=2 约 32px
 
-// ── Pixel 表情：在 idle 屏中段画一个可爱的小脸，替换无效的音量条
-// 状态：idle = 微笑；listening = "o"嘴；可后续扩展为 thinking / sleeping
-// 单纯用基本图元，避免依赖 emoji 字库
+// ── Pixel 表情：黑底 + 眉毛 + 眼睛 + 嘴
+// 不画脸盘 — 让表情漂浮在屏幕中段更轻盈
+// 状态：idle = 微笑；listening = "o"嘴
 static inline void drawPixelFace(int cx, int cy, bool listening) {
-    // 脸部圆背景
-    M5.Display.fillCircle(cx, cy, 38, 0x05FF /*青蓝*/);
-    M5.Display.drawCircle(cx, cy, 38, TFT_WHITE);
+    // ── 眉毛 — 22px 宽、3px 厚、中段微抬（友好/醒着）─────
+    int browY = cy - 22;
+    for (int i = -11; i <= 11; i++) {
+        int absI = i < 0 ? -i : i;
+        int lift = (11 - absI) / 6;  // 中间最高 +1，两端 0
+        for (int t = 0; t < 3; t++) {
+            M5.Display.drawPixel(cx - 28 + i, browY - lift + t, TFT_WHITE);
+            M5.Display.drawPixel(cx + 28 + i, browY - lift + t, TFT_WHITE);
+        }
+    }
 
-    // 两只眼
-    int eyeY = cy - 6;
-    int eyeOffsetX = 14;
-    int eyeR = 5;
-    M5.Display.fillCircle(cx - eyeOffsetX, eyeY, eyeR, TFT_BLACK);
-    M5.Display.fillCircle(cx + eyeOffsetX, eyeY, eyeR, TFT_BLACK);
-    // 高光
-    M5.Display.fillCircle(cx - eyeOffsetX + 1, eyeY - 1, 1, TFT_WHITE);
-    M5.Display.fillCircle(cx + eyeOffsetX + 1, eyeY - 1, 1, TFT_WHITE);
+    // ── 眼睛 — 白色，黑瞳，小高光 ─────────────────────
+    int eyeY = cy - 5;
+    int eyeR = 9;
+    M5.Display.fillCircle(cx - 28, eyeY, eyeR, TFT_WHITE);
+    M5.Display.fillCircle(cx + 28, eyeY, eyeR, TFT_WHITE);
+    M5.Display.fillCircle(cx - 28, eyeY, 4, TFT_BLACK);
+    M5.Display.fillCircle(cx + 28, eyeY, 4, TFT_BLACK);
+    M5.Display.fillCircle(cx - 28 + 2, eyeY - 2, 1, TFT_WHITE);
+    M5.Display.fillCircle(cx + 28 + 2, eyeY - 2, 1, TFT_WHITE);
 
-    // 嘴
+    // ── 嘴巴 ──────────────────────────────────────────
     if (listening) {
-        // "o" 形 — 表示正在听
-        M5.Display.drawCircle(cx, cy + 14, 5, TFT_BLACK);
-        M5.Display.drawCircle(cx, cy + 14, 6, TFT_BLACK);
+        // "O" 形 — 张嘴在听
+        M5.Display.fillCircle(cx, cy + 20, 7, TFT_WHITE);
+        M5.Display.fillCircle(cx, cy + 20, 5, TFT_BLACK);
     } else {
-        // 微笑曲线 — 用抛物线点阵近似画粗弧
-        for (int i = -12; i <= 12; i++) {
-            int x = cx + i;
-            int y = cy + 12 + (i * i) / 18;  // 向上微弯成笑
-            M5.Display.drawPixel(x, y, TFT_BLACK);
-            M5.Display.drawPixel(x, y + 1, TFT_BLACK);
+        // 微笑：抛物线 — 中点最低、两端上翘（这次方向对了）
+        // y_center = cy + 22（最大 y）；y_corners = cy + 22 - (14*14)/14 = cy + 8（更小，向上翘）
+        for (int i = -14; i <= 14; i++) {
+            int y = cy + 22 - (i * i) / 14;
+            M5.Display.drawPixel(cx + i, y,     TFT_WHITE);
+            M5.Display.drawPixel(cx + i, y + 1, TFT_WHITE);
         }
     }
 }
