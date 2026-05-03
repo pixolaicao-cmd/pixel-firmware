@@ -292,7 +292,25 @@ String _scanNetworksJson() {
     return json;
 }
 
-void startCaptivePortal() {
+// Cancel 按钮矩形（main.cpp / 内部循环触摸用）
+static const int CAPTIVE_CANCEL_X1 = 80, CAPTIVE_CANCEL_Y1 = 180;
+static const int CAPTIVE_CANCEL_X2 = 240, CAPTIVE_CANCEL_Y2 = 220;
+
+// 在配网屏底部画一个 Cancel 按钮 — 用户改主意时退路
+static void _drawCaptiveCancelButton() {
+    M5.Display.fillRoundRect(80, 180, 160, 40, 10, 0x2104);  // 暗灰
+    M5.Display.drawRoundRect(80, 180, 160, 40, 10, TFT_WHITE);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE, 0x2104);
+    const char* msg = "Cancel";
+    int tw = (int)strlen(msg) * 12;
+    M5.Display.setCursor(80 + (160 - tw) / 2, 180 + (40 - 16) / 2);
+    M5.Display.print(msg);
+}
+
+// 返回 true=用户配好新网（已 saveWiFiCreds + 即将 restart 由 caller 决定），
+// false=用户取消或超时（caller 应回主屏）
+bool startCaptivePortal() {
     // 1. 启 AP — SSID 和密码都从 MAC 派生（每台设备唯一）
     WiFi.mode(WIFI_AP);
     String ssid = apSsid();
@@ -304,6 +322,7 @@ void startCaptivePortal() {
                   ssid.c_str(), pass.c_str(), apIP.toString().c_str());
     // 屏幕同时显示 SSID + 密码 — 用户当面看着抄
     displayShow(ssid.c_str(), "Password:", pass.c_str());
+    _drawCaptiveCancelButton();
 
     // 2. DNS 全域名劫持 → 任何域名都解析回 192.168.4.1
     //    这是触发手机"自动弹出登录页"的关键 — 没有这一步只能让用户手动输 IP
@@ -322,6 +341,10 @@ void startCaptivePortal() {
         apServer.send(200, "application/json", json);
     });
 
+    // 用静态 flag 通知主循环"配置已保存"——比 lambda 里直接 ESP.restart 干净，
+    // 给主循环一个机会先关 AP/DNS/HTTP 再 restart（防止 success page 还没回出去）
+    static bool s_saved = false;
+    s_saved = false;
     apServer.on("/save", HTTP_POST, []() {
         String ssid = apServer.arg("ssid");
         String pass = apServer.arg("password");
@@ -331,9 +354,8 @@ void startCaptivePortal() {
         }
         saveWiFiCreds(ssid, pass);
         apServer.send(200, "text/html", SUCCESS_PAGE);
-        Serial.printf("[WiFi] Saved creds for SSID: %s — restarting\n", ssid.c_str());
-        delay(1500);
-        ESP.restart();
+        Serial.printf("[WiFi] Saved creds for SSID: %s\n", ssid.c_str());
+        s_saved = true;
     });
 
     // 4. iOS / macOS captive 探测路径 — 必须返回 200 + 非苹果 success 标记，
@@ -363,14 +385,50 @@ void startCaptivePortal() {
     // 配网状态保持 SSID/密码可见 — 用户连上前要看着抄
     // (captive portal 弹页面后用户也只需点选 → 不必再切屏)
 
-    // 6. 服务循环（最多 5 分钟，期间 dnsServer + apServer 都得喂）
+    // 6. 服务循环（最多 5 分钟）；同时监听物理屏幕的 Cancel 按钮
+    bool cancelled = false;
+    bool wasTouching = false;
     unsigned long start = millis();
     while (millis() - start < 300000) {
         dnsServer.processNextRequest();
         apServer.handleClient();
+
+        // 用户在保存页之前发完 /save 请求，回包还没来得及 flush 就 restart
+        // 会让用户的浏览器看到 connection reset。给一个短延时让 SUCCESS_PAGE 流出去。
+        if (s_saved) {
+            delay(500);
+            apServer.handleClient();  // 再给 HTTP 一次机会 flush
+            apServer.stop();
+            dnsServer.stop();
+            WiFi.softAPdisconnect(true);
+            return true;
+        }
+
+        // 检测屏幕 Cancel 按钮（边沿触发：松手时算一次点击）
+        M5.update();
+        bool nowT = false;
+        if (M5.Touch.getCount() > 0) {
+            auto t = M5.Touch.getDetail(0);
+            if (t.x >= CAPTIVE_CANCEL_X1 && t.x <= CAPTIVE_CANCEL_X2 &&
+                t.y >= CAPTIVE_CANCEL_Y1 && t.y <= CAPTIVE_CANCEL_Y2) {
+                nowT = true;
+            }
+        }
+        if (wasTouching && !nowT) {
+            cancelled = true;
+            break;
+        }
+        wasTouching = nowT;
+
         delay(2);
     }
-    // 超时退出（dnsServer.stop 由 ESP.restart 之前的析构处理）
+    // 超时或取消 — 干净关掉 AP/DNS/HTTP，让 caller 决定下一步
+    apServer.stop();
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    Serial.printf("[WiFi] Captive portal exited: %s\n",
+                  cancelled ? "cancelled by user" : "timeout");
+    return false;
 }
 
 // 单网络连接尝试 — 8 秒内连不上就放弃

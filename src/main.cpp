@@ -536,15 +536,24 @@ void loop() {
                             g_currentSsid, g_batteryPct, g_charging);
                 currentState = State::IDLE;
             } else if (hit == 2) {
-                // Switch WiFi → 直接打开配网热点
-                // 用户在手机上看到 Pixel-XXXXXX，连进去就能挑/加新网
-                // startCaptivePortal() 在保存或超时后会 ESP.restart()，所以下面
-                // 这行如果跑到了说明 5 分钟超时 — 重启回 IDLE 比较干净
+                // Switch WiFi → 打开配网热点
+                // 返回 true=保存了新网（重启自动连）；false=用户 Cancel/超时（回主屏不动）
                 Serial.println("[Pixel] User requested WiFi switch — opening AP");
                 WiFi.disconnect(true, true);
                 delay(200);
-                startCaptivePortal();
-                ESP.restart();
+                bool saved = startCaptivePortal();
+                if (saved) {
+                    Serial.println("[Pixel] New WiFi saved — restarting");
+                    delay(500);
+                    ESP.restart();
+                }
+                // 取消或超时 → 重连原网，回主屏
+                Serial.println("[Pixel] Switch cancelled — reconnecting original network");
+                connectWiFi();
+                refreshStatusInfo(true);
+                displayIdle("Pixel AI", "Ready!", false,
+                            g_currentSsid, g_batteryPct, g_charging);
+                currentState = State::IDLE;
             }
             break;
         }
