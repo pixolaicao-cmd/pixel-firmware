@@ -252,21 +252,37 @@ void displaySettings(const char* ssid, const char* ip, int rssi,
     labelLine("Device:", (tokenShort && strlen(tokenShort) > 0) ? tokenShort : "Not paired",
               (tokenShort && strlen(tokenShort) > 0) ? TFT_WHITE : TFT_YELLOW);
 
-    // 底部提示 — 全宽框，"tap to close"
-    const int bx = 20, by = 180, bw = 280, bh = 40;
-    M5.Display.fillRoundRect(bx, by, bw, bh, 10, 0x2104);  // 暗灰
-    M5.Display.drawRoundRect(bx, by, bw, bh, 10, TFT_WHITE);
+    // 底部两个按钮：换 WiFi（青）+ 关闭（暗灰）
+    // 矩形坐标对外暴露成 SETTINGS_BTN_*，main.cpp 触摸判定要用
+    const int by = 180, bh = 40;
+    // 换 WiFi（左）
+    M5.Display.fillRoundRect(8, by, 184, bh, 10, 0x05FF);  // 青蓝
+    M5.Display.drawRoundRect(8, by, 184, bh, 10, TFT_WHITE);
     M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE, 0x05FF);
+    const char* swMsg = "Switch WiFi";
+    int sw = (int)strlen(swMsg) * 12;
+    M5.Display.setCursor(8 + (184 - sw) / 2, by + (bh - 16) / 2);
+    M5.Display.print(swMsg);
+    // 关闭（右）
+    M5.Display.fillRoundRect(200, by, 112, bh, 10, 0x2104);
+    M5.Display.drawRoundRect(200, by, 112, bh, 10, TFT_WHITE);
     M5.Display.setTextColor(TFT_WHITE, 0x2104);
-    const char* msg = "Tap to close";
-    int tw = (int)strlen(msg) * 12;
-    M5.Display.setCursor(bx + (bw - tw) / 2, by + (bh - 16) / 2);
-    M5.Display.print(msg);
+    const char* clMsg = "Close";
+    int cw = (int)strlen(clMsg) * 12;
+    M5.Display.setCursor(200 + (112 - cw) / 2, by + (bh - 16) / 2);
+    M5.Display.print(clMsg);
 
     // 复位
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 }
+
+// 按钮矩形（main.cpp 触摸判定用，必须和 displaySettings 里画的一致）
+static const int SETTINGS_SWITCH_X1 = 8,   SETTINGS_SWITCH_Y1 = 180;
+static const int SETTINGS_SWITCH_X2 = 192, SETTINGS_SWITCH_Y2 = 220;
+static const int SETTINGS_CLOSE_X1  = 200, SETTINGS_CLOSE_Y1  = 180;
+static const int SETTINGS_CLOSE_X2  = 312, SETTINGS_CLOSE_Y2  = 220;
 
 // ── 说话动画 ─────────────────────────────────────
 // 实现思路：face 静态部分（眉、眼）只画一次；嘴巴每帧重画一个小区域。

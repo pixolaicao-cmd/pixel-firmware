@@ -115,16 +115,36 @@ bool tapOnStatusBar() {
 #endif
 }
 
-// ── 全屏触摸 — 用于设置页的"点任意位置返回"
-static bool g_lastAnyPressed = false;
-bool tapAnywhere() {
+// ── 设置页按钮触摸（边沿触发，记录按下时落在哪个矩形）─────
+// 返回值：0=无、1=Close、2=Switch WiFi
+static bool g_lastSettingsPressed = false;
+static int  g_lastSettingsBtn = 0;
+int settingsTap() {
 #if USE_TOUCH_BTN
-    bool now = (M5.Touch.getCount() > 0);
-    bool justReleased = (g_lastAnyPressed && !now);
-    g_lastAnyPressed = now;
-    return justReleased;
+    bool now = false;
+    int hit = 0;
+    if (M5.Touch.getCount() > 0) {
+        auto t = M5.Touch.getDetail(0);
+        now = true;
+        if (t.x >= SETTINGS_SWITCH_X1 && t.x <= SETTINGS_SWITCH_X2 &&
+            t.y >= SETTINGS_SWITCH_Y1 && t.y <= SETTINGS_SWITCH_Y2) {
+            hit = 2;
+        } else if (t.x >= SETTINGS_CLOSE_X1 && t.x <= SETTINGS_CLOSE_X2 &&
+                   t.y >= SETTINGS_CLOSE_Y1 && t.y <= SETTINGS_CLOSE_Y2) {
+            hit = 1;
+        }
+        if (hit != 0) g_lastSettingsBtn = hit;  // 记按下时所在按钮
+    }
+    bool justReleased = (g_lastSettingsPressed && !now);
+    g_lastSettingsPressed = now;
+    if (justReleased) {
+        int b = g_lastSettingsBtn;
+        g_lastSettingsBtn = 0;
+        return b;
+    }
+    return 0;
 #else
-    return false;
+    return 0;
 #endif
 }
 
@@ -507,15 +527,27 @@ void loop() {
             break;
 
         // ── 设置页 ────────────────────────────────────────────
-        case State::SETTINGS:
-            // 任意位置点击 → 退出（边沿触发，避免按住时反复跳出再进）
-            if (tapAnywhere()) {
+        case State::SETTINGS: {
+            int hit = settingsTap();
+            if (hit == 1) {
+                // Close
                 refreshStatusInfo(true);
                 displayIdle("Pixel AI", "Ready!", false,
                             g_currentSsid, g_batteryPct, g_charging);
                 currentState = State::IDLE;
+            } else if (hit == 2) {
+                // Switch WiFi → 直接打开配网热点
+                // 用户在手机上看到 Pixel-XXXXXX，连进去就能挑/加新网
+                // startCaptivePortal() 在保存或超时后会 ESP.restart()，所以下面
+                // 这行如果跑到了说明 5 分钟超时 — 重启回 IDLE 比较干净
+                Serial.println("[Pixel] User requested WiFi switch — opening AP");
+                WiFi.disconnect(true, true);
+                delay(200);
+                startCaptivePortal();
+                ESP.restart();
             }
             break;
+        }
 
         case State::ERROR:
             ledBlink(3, 300);
