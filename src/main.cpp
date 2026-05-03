@@ -37,6 +37,7 @@ enum class State {
     PROCESSING,   // 合并 UPLOADING + THINKING（voicePipeline 一次搞定）
     SPEAKING,
     PAIRING,
+    SETTINGS,     // 设置页面：显示 WiFi/电量/设备 信息
     ERROR
 };
 
@@ -94,6 +95,62 @@ bool isBtnPressed() {
 #else
     return (digitalRead(BTN_PIN) == LOW);
 #endif
+}
+
+// ── 顶部状态栏点击检测（单击进设置）──────────────
+// 用 wasClicked 边沿触发：避免按住时反复进设置
+static bool g_lastTopBarPressed = false;
+bool tapOnStatusBar() {
+#if USE_TOUCH_BTN
+    bool now = false;
+    if (M5.Touch.getCount() > 0) {
+        auto t = M5.Touch.getDetail(0);
+        if (t.y >= 0 && t.y < 22) now = true;  // STATUS_BAR_H = 22
+    }
+    bool justReleased = (g_lastTopBarPressed && !now);
+    g_lastTopBarPressed = now;
+    return justReleased;
+#else
+    return false;
+#endif
+}
+
+// ── 全屏触摸 — 用于设置页的"点任意位置返回"
+static bool g_lastAnyPressed = false;
+bool tapAnywhere() {
+#if USE_TOUCH_BTN
+    bool now = (M5.Touch.getCount() > 0);
+    bool justReleased = (g_lastAnyPressed && !now);
+    g_lastAnyPressed = now;
+    return justReleased;
+#else
+    return false;
+#endif
+}
+
+// ── 顶栏所需信息：SSID / 电量 / 充电（缓存避免每帧重读硬件）
+static char g_currentSsid[33] = "";
+static int  g_batteryPct = -1;
+static bool g_charging = false;
+static unsigned long g_lastStatusRefresh = 0;
+
+void refreshStatusInfo(bool force = false) {
+    unsigned long now = millis();
+    if (!force && now - g_lastStatusRefresh < 5000) return;  // 5s 节流
+    g_lastStatusRefresh = now;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        String s = WiFi.SSID();
+        size_t n = s.length();
+        if (n >= sizeof(g_currentSsid)) n = sizeof(g_currentSsid) - 1;
+        memcpy(g_currentSsid, s.c_str(), n);
+        g_currentSsid[n] = '\0';
+    } else {
+        g_currentSsid[0] = '\0';
+    }
+
+    g_batteryPct = M5.Power.getBatteryLevel();      // 0-100，无法读取时 -1
+    g_charging   = (M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging);
 }
 
 // 注：顶部触摸调音量已移除 — IDLE 状态 M5.Speaker 没 begin，setVolume 不生效，
@@ -222,7 +279,8 @@ void setup() {
                       g_deviceToken.substring(g_deviceToken.length() - 4).c_str());
     }
 
-    displayIdle("Pixel AI", "Ready!", false);
+    refreshStatusInfo(true);
+    displayIdle("Pixel AI", "Ready!", false, g_currentSsid, g_batteryPct, g_charging);
     Serial.println("[Pixel] Ready. Tap & hold screen to talk (or 'r' in Serial).");
 }
 
@@ -240,6 +298,36 @@ void loop() {
 
         // ── 待机 ──────────────────────────────────────────────
         case State::IDLE:
+            // 顶栏点击 → 打开设置（优先于 isBtnPressed，避免误触发录音）
+            if (tapOnStatusBar()) {
+                refreshStatusInfo(true);
+                currentState = State::SETTINGS;
+                String ipStr = WiFi.localIP().toString();
+                int rssi = WiFi.RSSI();
+                String tokShort;
+                if (!g_deviceToken.isEmpty() && g_deviceToken.length() >= 12) {
+                    tokShort = g_deviceToken.substring(0, 6) + "..." +
+                               g_deviceToken.substring(g_deviceToken.length() - 4);
+                }
+                displaySettings(g_currentSsid, ipStr.c_str(), rssi,
+                                g_batteryPct, g_charging, tokShort.c_str());
+                break;
+            }
+            // 周期刷新顶栏（电量/SSID 变化）— 5s 节流
+            {
+                static unsigned long lastBarPaint = 0;
+                if (millis() - lastBarPaint > 5000) {
+                    int prevPct = g_batteryPct;
+                    bool prevChg = g_charging;
+                    String prevSsid = String(g_currentSsid);
+                    refreshStatusInfo(false);
+                    if (g_batteryPct != prevPct || g_charging != prevChg ||
+                        prevSsid != g_currentSsid) {
+                        drawStatusBar(g_currentSsid, g_batteryPct, g_charging);
+                    }
+                    lastBarPaint = millis();
+                }
+            }
             if (isBtnPressed()) {
                 // 没 token 就不让进录音 — 否则 voicePipeline 会 NULL deref 崩
                 if (g_deviceToken.isEmpty()) {
@@ -401,7 +489,9 @@ void loop() {
             playMp3Buffer(mp3Buf, vr.mp3Size, displaySpeakingTick);
             ledOff();
 
-            displayIdle("Pixel AI", "Ready!", false);
+            refreshStatusInfo(true);
+            displayIdle("Pixel AI", "Ready!", false,
+                        g_currentSsid, g_batteryPct, g_charging);
             currentState = State::IDLE;
             break;
         }
@@ -414,6 +504,17 @@ void loop() {
         case State::PAIRING:
             // 预留：可在运行时重新发起配对（长按触发）
             currentState = State::IDLE;
+            break;
+
+        // ── 设置页 ────────────────────────────────────────────
+        case State::SETTINGS:
+            // 任意位置点击 → 退出（边沿触发，避免按住时反复跳出再进）
+            if (tapAnywhere()) {
+                refreshStatusInfo(true);
+                displayIdle("Pixel AI", "Ready!", false,
+                            g_currentSsid, g_batteryPct, g_charging);
+                currentState = State::IDLE;
+            }
             break;
 
         case State::ERROR:

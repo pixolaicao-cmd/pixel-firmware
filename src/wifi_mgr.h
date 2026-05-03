@@ -29,20 +29,106 @@ String apPassword() {
     return String("pixel-") + suf;          // e.g. "pixel-A1B2C3"
 }
 
-// 从 flash 读取保存的 WiFi 凭据
-bool loadWiFiCreds(String& ssid, String& password) {
+// ── 多网络记忆（最多 5 条）─────────────────────────────────
+// 设计：环形列表，按"最后一次连上"顺序排（slot 0 = 最近用过）
+// 每个 slot 用键 ssid0..ssid4 / pass0..pass4 存
+// 连接时：扫描周围 → 保存的网络里挑 RSSI 最强的那个 → 连
+// 老的单 slot 凭据（"ssid"/"pass"）首次启动自动迁移到 slot 0
+#define WIFI_MAX_SLOTS 5
+
+struct WifiSlot {
+    String ssid;
+    String password;
+};
+
+// 读全部 slot；空 ssid 的位置跳过。返回有效条数。
+int loadWiFiSlots(WifiSlot out[WIFI_MAX_SLOTS]) {
     prefs.begin("wifi", true);
-    ssid     = prefs.getString("ssid", "");
-    password = prefs.getString("pass", "");
+    int n = 0;
+    char k[8];
+    for (int i = 0; i < WIFI_MAX_SLOTS; i++) {
+        snprintf(k, sizeof(k), "ssid%d", i);
+        String s = prefs.getString(k, "");
+        if (s.length() == 0) continue;
+        snprintf(k, sizeof(k), "pass%d", i);
+        String p = prefs.getString(k, "");
+        out[n].ssid = s;
+        out[n].password = p;
+        n++;
+    }
+
+    // 一次性迁移：老格式（"ssid"/"pass"）→ 新 slot 0
+    // 只在新格式里完全没有这个 SSID 时才迁，避免重复
+    if (n < WIFI_MAX_SLOTS) {
+        String legacySsid = prefs.getString("ssid", "");
+        if (legacySsid.length() > 0) {
+            String legacyPass = prefs.getString("pass", "");
+            bool dup = false;
+            for (int i = 0; i < n; i++) if (out[i].ssid == legacySsid) { dup = true; break; }
+            if (!dup) {
+                out[n].ssid = legacySsid;
+                out[n].password = legacyPass;
+                n++;
+            }
+        }
+    }
     prefs.end();
-    return ssid.length() > 0;
+    return n;
 }
 
-void saveWiFiCreds(const String& ssid, const String& password) {
+// 持久化整个 slot 数组（slot 0 永远是最近用过的）
+static void _writeAllSlots(const WifiSlot slots[WIFI_MAX_SLOTS], int count) {
     prefs.begin("wifi", false);
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", password);
+    char k[8];
+    for (int i = 0; i < WIFI_MAX_SLOTS; i++) {
+        snprintf(k, sizeof(k), "ssid%d", i);
+        if (i < count) prefs.putString(k, slots[i].ssid);
+        else           prefs.remove(k);
+        snprintf(k, sizeof(k), "pass%d", i);
+        if (i < count) prefs.putString(k, slots[i].password);
+        else           prefs.remove(k);
+    }
+    // 老 key 清掉，防止下次启动又被迁回来
+    prefs.remove("ssid");
+    prefs.remove("pass");
     prefs.end();
+}
+
+// 把 (ssid, password) 提升到 slot 0；其它向后挤；超过 5 个挤掉最旧的
+void saveWiFiCreds(const String& ssid, const String& password) {
+    if (ssid.length() == 0) return;
+    WifiSlot slots[WIFI_MAX_SLOTS];
+    int n = loadWiFiSlots(slots);
+
+    // 找已有同名 SSID 的位置（更新密码用）
+    int existing = -1;
+    for (int i = 0; i < n; i++) if (slots[i].ssid == ssid) { existing = i; break; }
+
+    WifiSlot fresh;
+    fresh.ssid = ssid;
+    fresh.password = password;
+
+    // 把现有列表整体往后挪一格，前面腾出 slot 0
+    WifiSlot reordered[WIFI_MAX_SLOTS];
+    int outN = 0;
+    reordered[outN++] = fresh;
+    for (int i = 0; i < n && outN < WIFI_MAX_SLOTS; i++) {
+        if (i == existing) continue;            // 跳过同名（已经放 slot 0 了）
+        reordered[outN++] = slots[i];
+    }
+    _writeAllSlots(reordered, outN);
+    Serial.printf("[WiFi] saved '%s' (slot 0); total %d remembered\n",
+                  ssid.c_str(), outN);
+}
+
+// 后向兼容：旧代码用 loadWiFiCreds 拿 slot 0
+bool loadWiFiCreds(String& ssid, String& password) {
+    WifiSlot slots[WIFI_MAX_SLOTS];
+    int n = loadWiFiSlots(slots);
+    if (n == 0) return false;
+    ssid = slots[0].ssid;
+    password = slots[0].password;
+    return true;
 }
 
 // ── 配网页面 ────────────────────────────────────────────────────
@@ -287,42 +373,89 @@ void startCaptivePortal() {
     // 超时退出（dnsServer.stop 由 ESP.restart 之前的析构处理）
 }
 
+// 单网络连接尝试 — 8 秒内连不上就放弃
+// 比之前的 30s × 2 round 短得多 — 这是 #2 (失败检测加速) 的核心
+// 多网络场景下宁可快速失败、试下一个，也不要在错的 SSID 上耗 60 秒
+static bool _tryConnect(const String& ssid, const String& password, int timeoutSec = 8) {
+    WiFi.disconnect(true, true);
+    delay(150);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    int tries = 0;
+    int maxTries = timeoutSec * 2;  // 500ms/次
+    while (WiFi.status() != WL_CONNECTED && tries < maxTries) {
+        delay(500);
+        tries++;
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
 bool connectWiFi() {
-    String ssid, password;
-    if (!loadWiFiCreds(ssid, password)) {
-        Serial.println("[WiFi] No saved credentials, starting AP");
+    WifiSlot slots[WIFI_MAX_SLOTS];
+    int n = loadWiFiSlots(slots);
+    if (n == 0) {
+        Serial.println("[WiFi] No saved networks, starting captive portal");
         startCaptivePortal();
         return false;
     }
 
-    displayShow("Connecting...", ssid.c_str());
-    Serial.printf("[WiFi] Connecting to %s\n", ssid.c_str());
+    // 1. 扫一圈周围 WiFi，按 RSSI 排序
+    displayShow("Scanning WiFi...", "", "");
+    Serial.println("[WiFi] Scanning...");
+    int found = WiFi.scanNetworks(false /*async*/, true /*hidden*/);
+    if (found < 0) found = 0;
 
-    // 两轮尝试，每轮 30s。第一轮失败先 disconnect 再重 begin —— 路由器
-    // 偶发握手卡死时这能拉回来。仍然失败才 fallback 到 captive portal。
-    for (int round = 1; round <= 2; round++) {
-        WiFi.disconnect(true, true);
-        delay(200);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(ssid.c_str(), password.c_str());
-
-        int tries = 0;
-        while (WiFi.status() != WL_CONNECTED && tries < 60) {
-            delay(500);
-            tries++;
-            if ((tries % 10) == 0) {
-                Serial.printf("[WiFi] still trying... round %d, %ds\n", round, tries / 2);
+    // 2. 在保存的网络里挑一个【出现在扫描结果里】+【RSSI 最强】的
+    //    没扫到也没关系 — 后面会盲尝 slot 0（有的路由器对 hidden SSID 不响应扫描）
+    int bestSlotIdx = -1;
+    int bestRssi = -999;
+    for (int s = 0; s < n; s++) {
+        for (int f = 0; f < found; f++) {
+            if (WiFi.SSID(f) == slots[s].ssid) {
+                int rssi = WiFi.RSSI(f);
+                if (rssi > bestRssi) {
+                    bestRssi = rssi;
+                    bestSlotIdx = s;
+                }
+                break;  // 同 SSID 多个 AP，挑第一个匹配（已经按强排过了）
             }
         }
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-            displayShow("Connected!", WiFi.localIP().toString().c_str());
-            return true;
-        }
-        Serial.printf("[WiFi] round %d failed, retrying...\n", round);
+    }
+    WiFi.scanDelete();
+
+    // 3. 优先连"扫到的最强匹配"；如果什么也没匹配上，按记忆顺序盲试
+    int order[WIFI_MAX_SLOTS];
+    int orderN = 0;
+    if (bestSlotIdx >= 0) {
+        order[orderN++] = bestSlotIdx;
+        Serial.printf("[WiFi] Best match: '%s' rssi=%d (slot %d)\n",
+                      slots[bestSlotIdx].ssid.c_str(), bestRssi, bestSlotIdx);
+    }
+    for (int s = 0; s < n; s++) {
+        if (s == bestSlotIdx) continue;
+        order[orderN++] = s;
     }
 
-    Serial.println("[WiFi] All retries failed, starting AP");
+    // 4. 按顺序尝试，每个最多 8 秒
+    for (int i = 0; i < orderN; i++) {
+        const WifiSlot& slot = slots[order[i]];
+        Serial.printf("[WiFi] Trying '%s' (%d/%d)\n", slot.ssid.c_str(), i + 1, orderN);
+        displayShow("Connecting...", slot.ssid.c_str());
+        if (_tryConnect(slot.ssid, slot.password, 8)) {
+            Serial.printf("[WiFi] Connected to '%s'! IP: %s\n",
+                          slot.ssid.c_str(), WiFi.localIP().toString().c_str());
+            displayShow("Connected!", slot.ssid.c_str(),
+                        WiFi.localIP().toString().c_str());
+            // 这次连上的 SSID 提到 slot 0，下次开机直接命中
+            if (order[i] != 0) {
+                saveWiFiCreds(slot.ssid, slot.password);
+            }
+            return true;
+        }
+    }
+
+    Serial.printf("[WiFi] All %d saved networks failed, starting captive portal\n", orderN);
     startCaptivePortal();
     return false;
 }
