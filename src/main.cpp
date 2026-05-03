@@ -289,18 +289,20 @@ void setup() {
     displayShow("Pixel AI", "Checking pairing...");
     g_deviceToken = runPairingFlow(showPairingCode, showPairingWaiting, showPairingError);
 
+    refreshStatusInfo(true);
     if (g_deviceToken.isEmpty()) {
-        displayShow("Not paired", "Restart to retry");
-        Serial.println("[Pixel] Pairing failed or timed out");
-        // 不 block — 仍允许匿名使用（token 为空时 API 不带 Authorization header）
+        // UI 不能撒谎 — 没 token 就显示 Not paired 状态，让用户知道还需要操作
+        // 主屏 subLine 显示 "Not paired"，按 HOLD-TO-TALK 也会再次提示
+        Serial.println("[Pixel] Pairing failed or timed out — staying in unpaired state");
+        displayIdle("Pixel AI", "Not paired", false,
+                    g_currentSsid, g_batteryPct, g_charging);
     } else {
         Serial.printf("[Pixel] Token: %s...%s\n",
                       g_deviceToken.substring(0, 8).c_str(),
                       g_deviceToken.substring(g_deviceToken.length() - 4).c_str());
+        displayIdle("Pixel AI", "Ready!", false,
+                    g_currentSsid, g_batteryPct, g_charging);
     }
-
-    refreshStatusInfo(true);
-    displayIdle("Pixel AI", "Ready!", false, g_currentSsid, g_batteryPct, g_charging);
     Serial.println("[Pixel] Ready. Tap & hold screen to talk (or 'r' in Serial).");
 }
 
