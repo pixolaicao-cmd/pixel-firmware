@@ -162,13 +162,14 @@ struct VoiceResult {
     size_t  mp3Size;       // mp3Buf 里的有效字节数
     String  transcript;   // 转写原文（调试用）
     String  reply;        // AI 回复文字（调试用）
+    bool    recording;    // 云端 recording_mode 当前是否开启（X-Recording header）
     String  errorMsg;
 };
 
 VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
                            uint8_t* mp3Buf, size_t mp3BufSize,
                            const String& deviceToken = "") {
-    VoiceResult result = {false, 0, "", "", ""};
+    VoiceResult result = {false, 0, "", "", false, ""};
 
     WiFiClientSecure client;
     configureTls(client);
@@ -270,6 +271,12 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
         if (line.startsWith("X-Reply:")) {
             result.reply = line.substring(8);
             result.reply.trim();
+        }
+        if (line.startsWith("X-Recording:")) {
+            String v = line.substring(12);
+            v.trim();
+            // header 是 "1" / "0" — 任何非 "0" 都按 ON 解，避免 server 改格式时坏
+            result.recording = (v.length() > 0 && v != "0");
         }
         if (line.length() == 0) break;  // headers 结束
     }

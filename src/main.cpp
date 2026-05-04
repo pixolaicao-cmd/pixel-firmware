@@ -49,6 +49,11 @@ static size_t g_wavBytes = 0;
 // ---- 翻译模式 ----
 bool translateMode = false;
 
+// ---- 录音模式（云端 recording_mode 状态镜像）----
+// 由 voicePipeline 响应里的 X-Recording header 同步过来。
+// 状态栏会显示 ●REC，让用户一眼看出"现在说的话会被永久保存"。
+static bool g_recordingMode = false;
+
 bool isTranslateOn(const String& text) {
     return text.indexOf("翻译模式开启") >= 0 ||
            text.indexOf("翻译模式") >= 0 ||
@@ -295,13 +300,13 @@ void setup() {
         // 主屏 subLine 显示 "Not paired"，按 HOLD-TO-TALK 也会再次提示
         Serial.println("[Pixel] Pairing failed or timed out — staying in unpaired state");
         displayIdle("Pixel AI", "Not paired", false,
-                    g_currentSsid, g_batteryPct, g_charging);
+                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
     } else {
         Serial.printf("[Pixel] Token: %s...%s\n",
                       g_deviceToken.substring(0, 8).c_str(),
                       g_deviceToken.substring(g_deviceToken.length() - 4).c_str());
         displayIdle("Pixel AI", "Ready!", false,
-                    g_currentSsid, g_batteryPct, g_charging);
+                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
     }
     Serial.println("[Pixel] Ready. Tap & hold screen to talk (or 'r' in Serial).");
 }
@@ -332,7 +337,8 @@ void loop() {
                                g_deviceToken.substring(g_deviceToken.length() - 4);
                 }
                 displaySettings(g_currentSsid, ipStr.c_str(), rssi,
-                                g_batteryPct, g_charging, tokShort.c_str());
+                                g_batteryPct, g_charging, tokShort.c_str(),
+                                g_recordingMode);
                 break;
             }
             // 周期刷新顶栏（电量/SSID 变化）— 5s 节流
@@ -345,7 +351,7 @@ void loop() {
                     refreshStatusInfo(false);
                     if (g_batteryPct != prevPct || g_charging != prevChg ||
                         prevSsid != g_currentSsid) {
-                        drawStatusBar(g_currentSsid, g_batteryPct, g_charging);
+                        drawStatusBar(g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
                     }
                     lastBarPaint = millis();
                 }
@@ -491,6 +497,12 @@ void loop() {
             Serial.printf("[Pixel] STT: %s\n", vr.transcript.c_str());
             Serial.printf("[Pixel] AI:  %s\n", vr.reply.c_str());
 
+            // 同步云端 recording_mode 状态 — 状态栏 ●REC 的依据
+            if (g_recordingMode != vr.recording) {
+                Serial.printf("[Pixel] recording_mode: %s\n", vr.recording ? "ON" : "off");
+            }
+            g_recordingMode = vr.recording;
+
             // 检查翻译模式开启指令（在 STT 文本里）
             String tLow = vr.transcript;
             tLow.toLowerCase();
@@ -513,7 +525,7 @@ void loop() {
 
             refreshStatusInfo(true);
             displayIdle("Pixel AI", "Ready!", false,
-                        g_currentSsid, g_batteryPct, g_charging);
+                        g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
             currentState = State::IDLE;
             break;
         }
@@ -535,7 +547,7 @@ void loop() {
                 // Close
                 refreshStatusInfo(true);
                 displayIdle("Pixel AI", "Ready!", false,
-                            g_currentSsid, g_batteryPct, g_charging);
+                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
                 currentState = State::IDLE;
             } else if (hit == 2) {
                 // Switch WiFi → 打开配网热点
@@ -554,7 +566,7 @@ void loop() {
                 connectWiFi();
                 refreshStatusInfo(true);
                 displayIdle("Pixel AI", "Ready!", false,
-                            g_currentSsid, g_batteryPct, g_charging);
+                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
                 currentState = State::IDLE;
             }
             break;

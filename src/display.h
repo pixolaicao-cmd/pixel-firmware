@@ -90,10 +90,11 @@ void displayShow(const String& line1,
 }
 
 // ── 顶部状态栏 ─────────────────────────────────────
-// 高度 22px：左 WiFi SSID、右 电量百分比 + 充电图标
+// 高度 22px：左 WiFi SSID、中间 ●REC（如果在录音模式）、右 电量百分比 + 充电图标
 // 整条状态栏可点 → 进设置页（在 main.cpp 里检测）
 // 用 ssid="" 表示未连，会画红点
-static inline void drawStatusBar(const char* ssid, int batteryPct, bool charging) {
+static inline void drawStatusBar(const char* ssid, int batteryPct, bool charging,
+                                 bool recording = false) {
     // 清掉顶栏区域（避免叠加显示残留）
     M5.Display.fillRect(0, 0, 320, 22, TFT_BLACK);
 
@@ -105,13 +106,14 @@ static inline void drawStatusBar(const char* ssid, int batteryPct, bool charging
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.setCursor(34, 7);
+    // SSID 截断：录音中要为 "●REC" 让位（约 30px），所以可用宽度更短
+    int ssidMax = recording ? 16 : 22;
     if (connected) {
-        // 截断长 SSID（textsize=1，6px/char，留出右边电量空间 → 最多 ~22 字符）
         char buf[24];
         size_t n = strlen(ssid);
-        if (n > 22) {
-            memcpy(buf, ssid, 19);
-            memcpy(buf + 19, "...", 4);
+        if (n > (size_t)ssidMax) {
+            memcpy(buf, ssid, ssidMax - 3);
+            memcpy(buf + ssidMax - 3, "...", 4);
         } else {
             memcpy(buf, ssid, n + 1);
         }
@@ -144,6 +146,16 @@ static inline void drawStatusBar(const char* ssid, int batteryPct, bool charging
         M5.Display.fillTriangle(lx + 5, ly + 7, lx + 9, ly + 7, lx + 5, ly + 14, TFT_CYAN);
     }
 
+    // 中间：●REC 红色指示（录音模式下）— 放在充电图标/电量左边一点
+    if (recording) {
+        int recX = charging ? (pctX - 18 - 30) : (pctX - 4 - 30);
+        if (recX < 160) recX = 160;  // 不要压到 SSID
+        M5.Display.fillCircle(recX, 11, 4, TFT_RED);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.setCursor(recX + 7, 7);
+        M5.Display.print("REC");
+    }
+
     // 复位文字样式
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -154,12 +166,14 @@ static const int STATUS_BAR_H = 22;
 
 // 待机画面：顶栏 + 中段表情 + 下方"按住说话"
 // pressing=true 时按钮变红色（录音中）；false 是青色待机色
+// recording=true 表示云端 recording_mode 已开启，状态栏显示 ●REC
 void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", bool pressing = false,
-                 const char* wifiSsid = nullptr, int batteryPct = -1, bool charging = false) {
+                 const char* wifiSsid = nullptr, int batteryPct = -1, bool charging = false,
+                 bool recording = false) {
     M5.Display.fillScreen(TFT_BLACK);
 
-    // 顶部状态栏 — WiFi + 电量
-    drawStatusBar(wifiSsid, batteryPct, charging);
+    // 顶部状态栏 — WiFi + 电量 + (●REC if recording mode on)
+    drawStatusBar(wifiSsid, batteryPct, charging, recording);
 
     // 副标题（可选）— 顶栏下面一行
     if (subLine && strlen(subLine) > 0) {
@@ -204,11 +218,12 @@ void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", boo
 // 任何位置点击 → 退出回 idle
 void displaySettings(const char* ssid, const char* ip, int rssi,
                      int batteryPct, bool charging,
-                     const char* tokenShort) {
+                     const char* tokenShort,
+                     bool recording = false) {
     M5.Display.fillScreen(TFT_BLACK);
 
-    // 顶栏依然显示 — 设置页里也能扫一眼电量
-    drawStatusBar(ssid, batteryPct, charging);
+    // 顶栏依然显示 — 设置页里也能扫一眼电量 + 录音状态
+    drawStatusBar(ssid, batteryPct, charging, recording);
 
     // 标题
     M5.Display.setTextSize(2);
@@ -251,6 +266,9 @@ void displaySettings(const char* ssid, const char* ip, int rssi,
 
     labelLine("Device:", (tokenShort && strlen(tokenShort) > 0) ? tokenShort : "Not paired",
               (tokenShort && strlen(tokenShort) > 0) ? TFT_WHITE : TFT_YELLOW);
+
+    labelLine("Recording:", recording ? "ON (saving forever)" : "off (24h temp)",
+              recording ? TFT_RED : 0x7BEF);
 
     // 底部两个按钮：换 WiFi（青）+ 关闭（暗灰）
     // 矩形坐标对外暴露成 SETTINGS_BTN_*，main.cpp 触摸判定要用
