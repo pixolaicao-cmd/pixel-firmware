@@ -54,6 +54,12 @@ bool translateMode = false;
 // 状态栏会显示 ●REC，让用户一眼看出"现在说的话会被永久保存"。
 static bool g_recordingMode = false;
 
+// ---- 翻译模式（云端 translation_mode 状态镜像）----
+// 由 voicePipeline 的 X-Translation / X-Translation-Pair header 同步。
+// 设置页 Translate 按钮显示 ZH<>NO 之类。
+static bool   g_translationMode = false;
+static String g_translationPair = "";  // "zh:no" / "" 当未启用
+
 bool isTranslateOn(const String& text) {
     return text.indexOf("翻译模式开启") >= 0 ||
            text.indexOf("翻译模式") >= 0 ||
@@ -121,7 +127,7 @@ bool tapOnStatusBar() {
 }
 
 // ── 设置页按钮触摸（边沿触发，记录按下时落在哪个矩形）─────
-// 返回值：0=无、1=Close、2=Switch WiFi
+// 返回值：0=无、1=Close、2=Switch WiFi、3=Recording 切换、4=Translation 切换
 static bool g_lastSettingsPressed = false;
 static int  g_lastSettingsBtn = 0;
 int settingsTap() {
@@ -131,8 +137,14 @@ int settingsTap() {
     if (M5.Touch.getCount() > 0) {
         auto t = M5.Touch.getDetail(0);
         now = true;
-        if (t.x >= SETTINGS_SWITCH_X1 && t.x <= SETTINGS_SWITCH_X2 &&
-            t.y >= SETTINGS_SWITCH_Y1 && t.y <= SETTINGS_SWITCH_Y2) {
+        if (t.x >= SETTINGS_REC_X1 && t.x <= SETTINGS_REC_X2 &&
+            t.y >= SETTINGS_REC_Y1 && t.y <= SETTINGS_REC_Y2) {
+            hit = 3;
+        } else if (t.x >= SETTINGS_TRANS_X1 && t.x <= SETTINGS_TRANS_X2 &&
+                   t.y >= SETTINGS_TRANS_Y1 && t.y <= SETTINGS_TRANS_Y2) {
+            hit = 4;
+        } else if (t.x >= SETTINGS_SWITCH_X1 && t.x <= SETTINGS_SWITCH_X2 &&
+                   t.y >= SETTINGS_SWITCH_Y1 && t.y <= SETTINGS_SWITCH_Y2) {
             hit = 2;
         } else if (t.x >= SETTINGS_CLOSE_X1 && t.x <= SETTINGS_CLOSE_X2 &&
                    t.y >= SETTINGS_CLOSE_Y1 && t.y <= SETTINGS_CLOSE_Y2) {
@@ -338,7 +350,9 @@ void loop() {
                 }
                 displaySettings(g_currentSsid, ipStr.c_str(), rssi,
                                 g_batteryPct, g_charging, tokShort.c_str(),
-                                g_recordingMode);
+                                g_recordingMode,
+                                g_translationMode,
+                                g_translationPair.c_str());
                 break;
             }
             // 周期刷新顶栏（电量/SSID 变化）— 5s 节流
@@ -502,6 +516,15 @@ void loop() {
                 Serial.printf("[Pixel] recording_mode: %s\n", vr.recording ? "ON" : "off");
             }
             g_recordingMode = vr.recording;
+            // 同步云端 translation_mode + 语言对
+            if (g_translationMode != vr.translation
+                || g_translationPair != vr.translationPair) {
+                Serial.printf("[Pixel] translation_mode: %s (%s)\n",
+                              vr.translation ? "ON" : "off",
+                              vr.translationPair.c_str());
+            }
+            g_translationMode = vr.translation;
+            g_translationPair = vr.translationPair;
 
             // 检查翻译模式开启指令（在 STT 文本里）
             String tLow = vr.transcript;
@@ -542,6 +565,22 @@ void loop() {
 
         // ── 设置页 ────────────────────────────────────────────
         case State::SETTINGS: {
+            // helper：重画当前设置页（toggle 后立即反馈）
+            auto repaintSettings = [&]() {
+                String ipStr = WiFi.localIP().toString();
+                int rssi = WiFi.RSSI();
+                String tokShort;
+                if (!g_deviceToken.isEmpty() && g_deviceToken.length() >= 12) {
+                    tokShort = g_deviceToken.substring(0, 6) + "..." +
+                               g_deviceToken.substring(g_deviceToken.length() - 4);
+                }
+                displaySettings(g_currentSsid, ipStr.c_str(), rssi,
+                                g_batteryPct, g_charging, tokShort.c_str(),
+                                g_recordingMode,
+                                g_translationMode,
+                                g_translationPair.c_str());
+            };
+
             int hit = settingsTap();
             if (hit == 1) {
                 // Close
@@ -568,6 +607,54 @@ void loop() {
                 displayIdle("Pixel AI", "Ready!", false,
                             g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
                 currentState = State::IDLE;
+            } else if (hit == 3) {
+                // Recording toggle —— 乐观更新本地 + PUT /soul
+                bool next = !g_recordingMode;
+                g_recordingMode = next;
+                repaintSettings();
+                Serial.printf("[Pixel] User toggled recording_mode → %s\n",
+                              next ? "ON" : "off");
+                if (g_deviceToken.isEmpty()) {
+                    Serial.println("[Pixel] No device token — toggle local-only");
+                } else if (!setRecordingMode(next, g_deviceToken)) {
+                    Serial.println("[Pixel] setRecordingMode failed — rolling back");
+                    g_recordingMode = !next;
+                    repaintSettings();
+                }
+            } else if (hit == 4) {
+                // Translation toggle —— 关 / 循环切换 zh⇄no → zh⇄en → en⇄no
+                // 用户在 dashboard 可以选语言对；固件这里靠循环按键最稳。
+                bool turningOn = !g_translationMode;
+                String nextPair;
+                String langA, langB;
+                if (turningOn) {
+                    // 默认从挪威场景起步（用户主用语言）
+                    if (g_translationPair == "" || g_translationPair == "en:no") {
+                        langA = "zh"; langB = "no";
+                    } else if (g_translationPair == "zh:no") {
+                        langA = "zh"; langB = "en";
+                    } else {  // zh:en
+                        langA = "en"; langB = "no";
+                    }
+                    nextPair = langA + ":" + langB;
+                } else {
+                    nextPair = "";
+                }
+                bool prevMode = g_translationMode;
+                String prevPair = g_translationPair;
+                g_translationMode = turningOn;
+                g_translationPair = nextPair;
+                repaintSettings();
+                Serial.printf("[Pixel] User toggled translation_mode → %s (%s)\n",
+                              turningOn ? "ON" : "off", nextPair.c_str());
+                if (g_deviceToken.isEmpty()) {
+                    Serial.println("[Pixel] No device token — toggle local-only");
+                } else if (!setTranslationMode(turningOn, langA, langB, g_deviceToken)) {
+                    Serial.println("[Pixel] setTranslationMode failed — rolling back");
+                    g_translationMode = prevMode;
+                    g_translationPair = prevPair;
+                    repaintSettings();
+                }
             }
             break;
         }

@@ -92,6 +92,32 @@ String httpPostJson(const char* path, const String& body,
     return resp;
 }
 
+// ── 公开：JSON PUT ────────────────────────────────────────────
+// 用于设置类接口（/api/soul），同 POST 流程，仅 method 不同
+String httpPutJson(const char* path, const String& body,
+                   int timeoutMs = HTTP_TIMEOUT_MS,
+                   const String& deviceToken = "") {
+    WiFiClientSecure client;
+    configureTls(client);
+    client.setTimeout(timeoutMs / 1000 + 5);
+
+    if (!client.connect(API_HOST, API_PORT)) {
+        Serial.printf("[API] PUT connect failed: %s\n", path);
+        return "";
+    }
+    client.printf("PUT %s HTTP/1.1\r\nHost: %s\r\n", path, API_HOST);
+    client.printf("Content-Type: application/json\r\n");
+    client.printf("Content-Length: %d\r\n", (int)body.length());
+    if (deviceToken.length() > 0)
+        client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
+    client.printf("Connection: close\r\n\r\n");
+    client.print(body);
+
+    String resp = _readBody(client, timeoutMs);
+    client.stop();
+    return resp;
+}
+
 // ── 公开：JSON GET ────────────────────────────────────────────
 
 String httpGetJson(const char* path, const String& deviceToken = "") {
@@ -163,13 +189,15 @@ struct VoiceResult {
     String  transcript;   // 转写原文（调试用）
     String  reply;        // AI 回复文字（调试用）
     bool    recording;    // 云端 recording_mode 当前是否开启（X-Recording header）
+    bool    translation;  // 云端 translation_mode 当前是否开启（X-Translation header）
+    String  translationPair;  // "zh:no" 之类（X-Translation-Pair header）
     String  errorMsg;
 };
 
 VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
                            uint8_t* mp3Buf, size_t mp3BufSize,
                            const String& deviceToken = "") {
-    VoiceResult result = {false, 0, "", "", false, ""};
+    VoiceResult result = {false, 0, "", "", false, false, "", ""};
 
     WiFiClientSecure client;
     configureTls(client);
@@ -277,6 +305,16 @@ VoiceResult voicePipeline(const uint8_t* wavData, size_t wavSize,
             v.trim();
             // header 是 "1" / "0" — 任何非 "0" 都按 ON 解，避免 server 改格式时坏
             result.recording = (v.length() > 0 && v != "0");
+        }
+        if (line.startsWith("X-Translation:")) {
+            String v = line.substring(14);
+            v.trim();
+            result.translation = (v.length() > 0 && v != "0");
+        }
+        if (line.startsWith("X-Translation-Pair:")) {
+            String v = line.substring(19);
+            v.trim();
+            result.translationPair = v;  // 例 "zh:no"
         }
         if (line.length() == 0) break;  // headers 结束
     }
@@ -394,4 +432,32 @@ TranslateResult translateText(const String& text, const String& srcLang,
     JsonDocument doc;
     if (deserializeJson(doc, resp) != DeserializationError::Ok) return {"", ""};
     return {doc["translation"].as<String>(), doc["target_lang"].as<String>()};
+}
+
+// ============================================================
+// 设置开关 — 直接写 soul_settings（PUT /api/soul）
+// 用户在固件设置页点开关时调用，绕开语音触发的不稳定。
+// 只发用户改的字段，其它的服务端保留。
+// ============================================================
+bool setRecordingMode(bool enabled, const String& deviceToken) {
+    JsonDocument req;
+    req["recording_mode"] = enabled;
+    String body; serializeJson(req, body);
+    String resp = httpPutJson("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
+    return !resp.isEmpty();
+}
+
+bool setTranslationMode(bool enabled,
+                        const String& langA,
+                        const String& langB,
+                        const String& deviceToken) {
+    JsonDocument req;
+    req["translation_mode"] = enabled;
+    if (enabled) {
+        if (langA.length() > 0) req["translation_lang_a"] = langA;
+        if (langB.length() > 0) req["translation_lang_b"] = langB;
+    }
+    String body; serializeJson(req, body);
+    String resp = httpPutJson("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
+    return !resp.isEmpty();
 }

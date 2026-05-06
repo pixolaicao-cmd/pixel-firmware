@@ -219,7 +219,9 @@ void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", boo
 void displaySettings(const char* ssid, const char* ip, int rssi,
                      int batteryPct, bool charging,
                      const char* tokenShort,
-                     bool recording = false) {
+                     bool recording = false,
+                     bool translation = false,
+                     const char* translationPair = nullptr) {
     M5.Display.fillScreen(TFT_BLACK);
 
     // 顶栏依然显示 — 设置页里也能扫一眼电量 + 录音状态
@@ -234,8 +236,8 @@ void displaySettings(const char* ssid, const char* ip, int rssi,
     // 内容用 textsize 1（6×8 字体），密度高、放得下
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    int y = 60;
-    const int LH = 14;
+    int y = 58;
+    const int LH = 13;
 
     auto labelLine = [&](const char* label, const char* value, uint16_t valColor) {
         M5.Display.setTextColor(0x7BEF, TFT_BLACK);  // 灰
@@ -267,29 +269,71 @@ void displaySettings(const char* ssid, const char* ip, int rssi,
     labelLine("Device:", (tokenShort && strlen(tokenShort) > 0) ? tokenShort : "Not paired",
               (tokenShort && strlen(tokenShort) > 0) ? TFT_WHITE : TFT_YELLOW);
 
-    labelLine("Recording:", recording ? "ON (saving forever)" : "off (24h temp)",
-              recording ? TFT_RED : 0x7BEF);
+    // ── 切换按钮：4 个排成 2×2 ──────────────────────────────
+    // 用户希望「点一下就能切」，比语音触发更稳。
+    // 按钮 H = 30，textsize 1；状态颜色一目了然：开=亮、关=暗。
+    const int BX1 = 8,   BX2 = 164;
+    const int BW = 148, BH = 30;
+    // Row 1 — 开关行
+    const int R1Y = 142;
+    // Row 2 — 系统行（Switch WiFi / Close）
+    const int R2Y = 182;
 
-    // 底部两个按钮：换 WiFi（青）+ 关闭（暗灰）
-    // 矩形坐标对外暴露成 SETTINGS_BTN_*，main.cpp 触摸判定要用
-    const int by = 180, bh = 40;
-    // 换 WiFi（左）
-    M5.Display.fillRoundRect(8, by, 184, bh, 10, 0x05FF);  // 青蓝
-    M5.Display.drawRoundRect(8, by, 184, bh, 10, TFT_WHITE);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(TFT_WHITE, 0x05FF);
-    const char* swMsg = "Switch WiFi";
-    int sw = (int)strlen(swMsg) * 12;
-    M5.Display.setCursor(8 + (184 - sw) / 2, by + (bh - 16) / 2);
-    M5.Display.print(swMsg);
-    // 关闭（右）
-    M5.Display.fillRoundRect(200, by, 112, bh, 10, 0x2104);
-    M5.Display.drawRoundRect(200, by, 112, bh, 10, TFT_WHITE);
-    M5.Display.setTextColor(TFT_WHITE, 0x2104);
-    const char* clMsg = "Close";
-    int cw = (int)strlen(clMsg) * 12;
-    M5.Display.setCursor(200 + (112 - cw) / 2, by + (bh - 16) / 2);
-    M5.Display.print(clMsg);
+    auto drawBtn = [&](int x, int y_, int w, int h,
+                       const char* label,
+                       const char* sub,
+                       bool active,
+                       uint16_t activeBg,
+                       uint16_t idleBg,
+                       uint16_t border) {
+        uint16_t bg = active ? activeBg : idleBg;
+        M5.Display.fillRoundRect(x, y_, w, h, 8, bg);
+        M5.Display.drawRoundRect(x, y_, w, h, 8, border);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, bg);
+        // 主文字
+        int lw = (int)strlen(label) * 6;
+        M5.Display.setCursor(x + (w - lw) / 2, y_ + 6);
+        M5.Display.print(label);
+        // 副文字（状态/语言对）
+        if (sub && strlen(sub) > 0) {
+            int sw = (int)strlen(sub) * 6;
+            M5.Display.setCursor(x + (w - sw) / 2, y_ + 17);
+            M5.Display.print(sub);
+        }
+    };
+
+    // 录音切换 — 开 = 红
+    drawBtn(BX1, R1Y, BW, BH,
+            "REC",
+            recording ? "ON  saving" : "off  24h",
+            recording, 0xC000 /*deep red*/, 0x2104, TFT_WHITE);
+
+    // 翻译切换 — 开 = 蓝
+    char trSub[24];
+    if (translation && translationPair && strlen(translationPair) > 0) {
+        // "zh:no" → "ZH<>NO"
+        char a[4] = {0}, b[4] = {0};
+        const char* colon = strchr(translationPair, ':');
+        if (colon) {
+            int la = (int)(colon - translationPair); if (la > 3) la = 3;
+            int lb = (int)strlen(colon + 1);          if (lb > 3) lb = 3;
+            for (int i = 0; i < la; i++) a[i] = (char)toupper(translationPair[i]);
+            for (int i = 0; i < lb; i++) b[i] = (char)toupper(colon[1 + i]);
+        }
+        snprintf(trSub, sizeof(trSub), "%s <> %s", a[0] ? a : "??", b[0] ? b : "??");
+    } else {
+        snprintf(trSub, sizeof(trSub), "off");
+    }
+    drawBtn(BX2, R1Y, BW, BH,
+            "Translate",
+            translation ? trSub : "off",
+            translation, 0x041F /*blue*/, 0x2104, TFT_WHITE);
+
+    // 换 WiFi
+    drawBtn(BX1, R2Y, BW, BH, "Switch WiFi", "", false, 0x05FF, 0x05FF, TFT_WHITE);
+    // 关闭
+    drawBtn(BX2, R2Y, BW, BH, "Close", "", false, 0x2104, 0x2104, TFT_WHITE);
 
     // 复位
     M5.Display.setTextSize(2);
@@ -297,10 +341,15 @@ void displaySettings(const char* ssid, const char* ip, int rssi,
 }
 
 // 按钮矩形（main.cpp 触摸判定用，必须和 displaySettings 里画的一致）
-static const int SETTINGS_SWITCH_X1 = 8,   SETTINGS_SWITCH_Y1 = 180;
-static const int SETTINGS_SWITCH_X2 = 192, SETTINGS_SWITCH_Y2 = 220;
-static const int SETTINGS_CLOSE_X1  = 200, SETTINGS_CLOSE_Y1  = 180;
-static const int SETTINGS_CLOSE_X2  = 312, SETTINGS_CLOSE_Y2  = 220;
+// 行 1：REC / Translate；行 2：Switch WiFi / Close
+static const int SETTINGS_REC_X1    = 8,   SETTINGS_REC_Y1    = 142;
+static const int SETTINGS_REC_X2    = 156, SETTINGS_REC_Y2    = 172;
+static const int SETTINGS_TRANS_X1  = 164, SETTINGS_TRANS_Y1  = 142;
+static const int SETTINGS_TRANS_X2  = 312, SETTINGS_TRANS_Y2  = 172;
+static const int SETTINGS_SWITCH_X1 = 8,   SETTINGS_SWITCH_Y1 = 182;
+static const int SETTINGS_SWITCH_X2 = 156, SETTINGS_SWITCH_Y2 = 212;
+static const int SETTINGS_CLOSE_X1  = 164, SETTINGS_CLOSE_Y1  = 182;
+static const int SETTINGS_CLOSE_X2  = 312, SETTINGS_CLOSE_Y2  = 212;
 
 // ── 说话动画 ─────────────────────────────────────
 // 实现思路：face 静态部分（眉、眼）只画一次；嘴巴每帧重画一个小区域。
