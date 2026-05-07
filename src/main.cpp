@@ -91,7 +91,8 @@ void ledBlink(int times, int ms = 100) {
 static bool g_btnSimPressed = false;
 
 // HOLD-TO-TALK 按钮在屏幕的实际矩形（与 displayIdle() 里画的位置一致）
-static const int BTN_RECT_X1 = 20,  BTN_RECT_Y1 = 140;
+// 主屏顶部腾出 124..152 给 REC / Translate chip 后，HOLD-TO-TALK 缩到 156..220
+static const int BTN_RECT_X1 = 20,  BTN_RECT_Y1 = 156;
 static const int BTN_RECT_X2 = 300, BTN_RECT_Y2 = 220;
 
 bool isBtnPressed() {
@@ -123,6 +124,39 @@ bool tapOnStatusBar() {
     return justReleased;
 #else
     return false;
+#endif
+}
+
+// ── IDLE 主屏 chip 点击：返回 0=无, 1=REC, 2=Translate ──
+// 边沿触发，避免按住时反复触发
+static bool g_lastIdleChipPressed = false;
+static int  g_lastIdleChipBtn = 0;
+int idleChipTap() {
+#if USE_TOUCH_BTN
+    bool now = false;
+    int hit = 0;
+    if (M5.Touch.getCount() > 0) {
+        auto t = M5.Touch.getDetail(0);
+        now = true;
+        if (t.x >= IDLE_REC_X1 && t.x <= IDLE_REC_X2 &&
+            t.y >= IDLE_REC_Y1 && t.y <= IDLE_REC_Y2) {
+            hit = 1;
+        } else if (t.x >= IDLE_TRANS_X1 && t.x <= IDLE_TRANS_X2 &&
+                   t.y >= IDLE_TRANS_Y1 && t.y <= IDLE_TRANS_Y2) {
+            hit = 2;
+        }
+        if (hit != 0) g_lastIdleChipBtn = hit;
+    }
+    bool justReleased = (g_lastIdleChipPressed && !now);
+    g_lastIdleChipPressed = now;
+    if (justReleased) {
+        int b = g_lastIdleChipBtn;
+        g_lastIdleChipBtn = 0;
+        return b;
+    }
+    return 0;
+#else
+    return 0;
 #endif
 }
 
@@ -312,13 +346,15 @@ void setup() {
         // 主屏 subLine 显示 "Not paired"，按 HOLD-TO-TALK 也会再次提示
         Serial.println("[Pixel] Pairing failed or timed out — staying in unpaired state");
         displayIdle("Pixel AI", "Not paired", false,
-                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
+                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                    g_translationMode, g_translationPair.c_str());
     } else {
         Serial.printf("[Pixel] Token: %s...%s\n",
                       g_deviceToken.substring(0, 8).c_str(),
                       g_deviceToken.substring(g_deviceToken.length() - 4).c_str());
         displayIdle("Pixel AI", "Ready!", false,
-                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
+                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                    g_translationMode, g_translationPair.c_str());
     }
     Serial.println("[Pixel] Ready. Tap & hold screen to talk (or 'r' in Serial).");
 }
@@ -333,10 +369,18 @@ void loop() {
     // 读 Serial 模拟按键（调试用备用通道）
     pollSerialSim();
 
+    // ── 主屏 chip 重绘 helper ─────────────────────────
+    // 仅用于 IDLE 状态下 chip 切换后的快速反馈
+    auto repaintIdle = [&]() {
+        displayIdle("Pixel AI", "Ready!", false,
+                    g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                    g_translationMode, g_translationPair.c_str());
+    };
+
     switch (currentState) {
 
         // ── 待机 ──────────────────────────────────────────────
-        case State::IDLE:
+        case State::IDLE: {
             // 顶栏点击 → 打开设置（优先于 isBtnPressed，避免误触发录音）
             if (tapOnStatusBar()) {
                 refreshStatusInfo(true);
@@ -353,6 +397,53 @@ void loop() {
                                 g_recordingMode,
                                 g_translationMode,
                                 g_translationPair.c_str());
+                break;
+            }
+            // 主屏 chip 切换：REC / Translate（不需进设置页）
+            int chipHit = idleChipTap();
+            if (chipHit == 1) {
+                bool next = !g_recordingMode;
+                g_recordingMode = next;
+                repaintIdle();
+                Serial.printf("[Pixel] IDLE chip toggled recording_mode → %s\n",
+                              next ? "ON" : "off");
+                if (!g_deviceToken.isEmpty() &&
+                    !setRecordingMode(next, g_deviceToken)) {
+                    Serial.println("[Pixel] setRecordingMode failed — rolling back");
+                    g_recordingMode = !next;
+                    repaintIdle();
+                }
+                break;
+            }
+            if (chipHit == 2) {
+                // 4-state cycle: off → 中⇄挪 → 中⇄英 → EN⇄NO → off
+                // 这样用户单击循环可达每个状态，包括明确的关闭。
+                bool nextOn = false;
+                String langA, langB, nextPair;
+                if (!g_translationMode) {
+                    nextOn = true;  langA = "zh"; langB = "no"; nextPair = "zh:no";
+                } else if (g_translationPair == "zh:no") {
+                    nextOn = true;  langA = "zh"; langB = "en"; nextPair = "zh:en";
+                } else if (g_translationPair == "zh:en") {
+                    nextOn = true;  langA = "en"; langB = "no"; nextPair = "en:no";
+                } else {
+                    // en:no（或异常值）→ off
+                    nextOn = false; nextPair = "";
+                }
+                bool prevMode = g_translationMode;
+                String prevPair = g_translationPair;
+                g_translationMode = nextOn;
+                g_translationPair = nextPair;
+                repaintIdle();
+                Serial.printf("[Pixel] IDLE chip translation_mode → %s (%s)\n",
+                              nextOn ? "ON" : "off", nextPair.c_str());
+                if (!g_deviceToken.isEmpty() &&
+                    !setTranslationMode(nextOn, langA, langB, g_deviceToken)) {
+                    Serial.println("[Pixel] setTranslationMode failed — rolling back");
+                    g_translationMode = prevMode;
+                    g_translationPair = prevPair;
+                    repaintIdle();
+                }
                 break;
             }
             // 周期刷新顶栏（电量/SSID 变化）— 5s 节流
@@ -376,7 +467,9 @@ void loop() {
                     displayShow("Not paired", "Restart device", "Pair in app");
                     Serial.println("[Pixel] Tap ignored — no device token (pairing required)");
                     delay(2000);
-                    displayIdle("Pixel AI", "Not paired", false);
+                    displayIdle("Pixel AI", "Not paired", false,
+                                g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                                g_translationMode, g_translationPair.c_str());
                     return;
                 }
                 if (!isWiFiConnected()) {
@@ -389,10 +482,13 @@ void loop() {
                 if (translateMode)
                     displayShow("[Translate]", "Recording...", "Release to send");
                 else
-                    displayIdle("Recording", "Release to send", true);
+                    displayIdle("Recording", "Release to send", true,
+                                g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                                g_translationMode, g_translationPair.c_str());
                 Serial.println("[Pixel] Recording...");
             }
             break;
+        }
 
         // ── 录音 ──────────────────────────────────────────────
         case State::RECORDING: {
@@ -548,7 +644,8 @@ void loop() {
 
             refreshStatusInfo(true);
             displayIdle("Pixel AI", "Ready!", false,
-                        g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
+                        g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                        g_translationMode, g_translationPair.c_str());
             currentState = State::IDLE;
             break;
         }
@@ -586,7 +683,8 @@ void loop() {
                 // Close
                 refreshStatusInfo(true);
                 displayIdle("Pixel AI", "Ready!", false,
-                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
+                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                            g_translationMode, g_translationPair.c_str());
                 currentState = State::IDLE;
             } else if (hit == 2) {
                 // Switch WiFi → 打开配网热点
@@ -605,7 +703,8 @@ void loop() {
                 connectWiFi();
                 refreshStatusInfo(true);
                 displayIdle("Pixel AI", "Ready!", false,
-                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode);
+                            g_currentSsid, g_batteryPct, g_charging, g_recordingMode,
+                            g_translationMode, g_translationPair.c_str());
                 currentState = State::IDLE;
             } else if (hit == 3) {
                 // Recording toggle —— 乐观更新本地 + PUT /soul

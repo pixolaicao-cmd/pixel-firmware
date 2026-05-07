@@ -27,19 +27,27 @@ static inline void configureTls(WiFiClientSecure& client) {
 
 static String _readBody(WiFiClientSecure& client, int timeoutMs) {
     // 跳过 headers
+    // ⚠️ 服务端用 "Connection: close" — 写完就关 socket。若只判 connected()，
+    //   socket 关了就退出，TLS buffer 里剩的 body 全丢 → caller 看到空 body。
+    //   必须用 (connected() || available()) 才不会丢数据。
     unsigned long t = millis() + timeoutMs;
-    while (client.connected() && millis() < t) {
+    while (millis() < t) {
+        if (!client.available() && !client.connected()) break;
+        if (!client.available()) { delay(5); continue; }
         String line = client.readStringUntil('\n');
         if (line == "\r" || line == "\r\n" || line.length() == 0) break;
     }
     String body = "";
     t = millis() + timeoutMs;
-    while (client.connected() && millis() < t) {
-        while (client.available()) {
+    while (millis() < t) {
+        if (client.available()) {
             body += (char)client.read();
             t = millis() + timeoutMs;  // 收到数据就续期
+        } else if (!client.connected()) {
+            break;
+        } else {
+            delay(2);
         }
-        delay(5);
     }
     return body;
 }
@@ -94,16 +102,18 @@ String httpPostJson(const char* path, const String& body,
 
 // ── 公开：JSON PUT ────────────────────────────────────────────
 // 用于设置类接口（/api/soul），同 POST 流程，仅 method 不同
-String httpPutJson(const char* path, const String& body,
-                   int timeoutMs = HTTP_TIMEOUT_MS,
-                   const String& deviceToken = "") {
+// 返回 HTTP status code（>=200 表示连上 + 收到了响应；0 表示连不上 / 完全没响应）
+// 设置类接口不关心 body — 只看 2xx，避免 TLS Connection: close 下 body 被吃掉的假阴性
+int httpPutJsonStatus(const char* path, const String& body,
+                      int timeoutMs = HTTP_TIMEOUT_MS,
+                      const String& deviceToken = "") {
     WiFiClientSecure client;
     configureTls(client);
     client.setTimeout(timeoutMs / 1000 + 5);
 
     if (!client.connect(API_HOST, API_PORT)) {
         Serial.printf("[API] PUT connect failed: %s\n", path);
-        return "";
+        return 0;
     }
     client.printf("PUT %s HTTP/1.1\r\nHost: %s\r\n", path, API_HOST);
     client.printf("Content-Type: application/json\r\n");
@@ -112,10 +122,33 @@ String httpPutJson(const char* path, const String& body,
         client.printf("Authorization: Bearer %s\r\n", deviceToken.c_str());
     client.printf("Connection: close\r\n\r\n");
     client.print(body);
+    client.flush();
 
-    String resp = _readBody(client, timeoutMs);
+    // 只读 status line — 不需要 body
+    int statusCode = 0;
+    unsigned long t = millis() + timeoutMs;
+    while (millis() < t) {
+        if (!client.available() && !client.connected()) break;
+        if (!client.available()) { delay(5); continue; }
+        String line = client.readStringUntil('\n');
+        line.trim();
+        if (line.startsWith("HTTP/")) {
+            int sp = line.indexOf(' ');
+            if (sp > 0) statusCode = line.substring(sp + 1, sp + 4).toInt();
+            break;
+        }
+    }
     client.stop();
-    return resp;
+    return statusCode;
+}
+
+// 兼容旧调用（返回 body 字符串）
+String httpPutJson(const char* path, const String& body,
+                   int timeoutMs = HTTP_TIMEOUT_MS,
+                   const String& deviceToken = "") {
+    int sc = httpPutJsonStatus(path, body, timeoutMs, deviceToken);
+    // 旧调用方只判断 isEmpty，给个非空提示 OK / 空表示失败
+    return (sc >= 200 && sc < 300) ? String("OK") : String("");
 }
 
 // ── 公开：JSON GET ────────────────────────────────────────────
@@ -443,8 +476,10 @@ bool setRecordingMode(bool enabled, const String& deviceToken) {
     JsonDocument req;
     req["recording_mode"] = enabled;
     String body; serializeJson(req, body);
-    String resp = httpPutJson("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
-    return !resp.isEmpty();
+    int sc = httpPutJsonStatus("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
+    Serial.printf("[API] setRecordingMode(%s) → HTTP %d\n",
+                  enabled ? "ON" : "off", sc);
+    return (sc >= 200 && sc < 300);
 }
 
 bool setTranslationMode(bool enabled,
@@ -458,6 +493,9 @@ bool setTranslationMode(bool enabled,
         if (langB.length() > 0) req["translation_lang_b"] = langB;
     }
     String body; serializeJson(req, body);
-    String resp = httpPutJson("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
-    return !resp.isEmpty();
+    int sc = httpPutJsonStatus("/api/soul", body, HTTP_TIMEOUT_MS, deviceToken);
+    Serial.printf("[API] setTranslationMode(%s, %s:%s) → HTTP %d\n",
+                  enabled ? "ON" : "off",
+                  langA.c_str(), langB.c_str(), sc);
+    return (sc >= 200 && sc < 300);
 }

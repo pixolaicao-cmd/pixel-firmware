@@ -164,12 +164,15 @@ static inline void drawStatusBar(const char* ssid, int batteryPct, bool charging
 // 顶栏在屏幕中的可点击范围 — main.cpp 里检测点击进设置页用
 static const int STATUS_BAR_H = 22;
 
-// 待机画面：顶栏 + 中段表情 + 下方"按住说话"
+// 待机画面：顶栏 + 中段表情 + 模式开关 chip + 下方"按住说话"
 // pressing=true 时按钮变红色（录音中）；false 是青色待机色
 // recording=true 表示云端 recording_mode 已开启，状态栏显示 ●REC
+// translation/translationPair：主屏右上 chip 显示当前翻译模式
 void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", bool pressing = false,
                  const char* wifiSsid = nullptr, int batteryPct = -1, bool charging = false,
-                 bool recording = false) {
+                 bool recording = false,
+                 bool translation = false,
+                 const char* translationPair = nullptr) {
     M5.Display.fillScreen(TFT_BLACK);
 
     // 顶部状态栏 — WiFi + 电量 + (●REC if recording mode on)
@@ -193,11 +196,59 @@ void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", boo
         M5.Display.print(topLine);
     }
 
-    // 屏幕中段 (y≈80-130) 画 Pixel 表情
-    drawPixelFace(160, 100, pressing);
+    // 屏幕中段 (y≈60-110) 画 Pixel 表情（往上挪 10px 给 chip 让出位置）
+    drawPixelFace(160, 90, pressing);
 
-    // 屏幕下半 (y=140-220) 画按钮
-    const int bx = 20, by = 140, bw = 280, bh = 80;
+    // ── 主屏 chip 开关：表情下方一行，HOLD-TO-TALK 上方 ─────
+    // 用户主屏直接看到 + 一点就切，不用进设置页
+    {
+        const int CY = 124, CH = 28;
+        const int CW = 142;
+        const int CXL = 12, CXR = 166;
+
+        auto drawChip = [&](int x, const char* label, const char* sub,
+                            bool active, uint16_t activeBg) {
+            uint16_t bg = active ? activeBg : 0x18C3;  // 深灰
+            M5.Display.fillRoundRect(x, CY, CW, CH, 8, bg);
+            M5.Display.drawRoundRect(x, CY, CW, CH, 8, TFT_WHITE);
+            M5.Display.setTextSize(1);
+            M5.Display.setTextColor(TFT_WHITE, bg);
+            int lw = (int)strlen(label) * 6;
+            M5.Display.setCursor(x + (CW - lw) / 2, CY + 5);
+            M5.Display.print(label);
+            if (sub && strlen(sub) > 0) {
+                int sw = (int)strlen(sub) * 6;
+                M5.Display.setCursor(x + (CW - sw) / 2, CY + 16);
+                M5.Display.print(sub);
+            }
+        };
+
+        // 翻译 chip 副文字
+        char trSub[24];
+        if (translation && translationPair && strlen(translationPair) > 0) {
+            char a[4] = {0}, b[4] = {0};
+            const char* colon = strchr(translationPair, ':');
+            if (colon) {
+                int la = (int)(colon - translationPair); if (la > 3) la = 3;
+                int lb = (int)strlen(colon + 1);          if (lb > 3) lb = 3;
+                for (int i = 0; i < la; i++) a[i] = (char)toupper(translationPair[i]);
+                for (int i = 0; i < lb; i++) b[i] = (char)toupper(colon[1 + i]);
+            }
+            snprintf(trSub, sizeof(trSub), "%s <> %s", a[0] ? a : "??", b[0] ? b : "??");
+        } else {
+            snprintf(trSub, sizeof(trSub), "off");
+        }
+
+        drawChip(CXL, "REC",
+                 recording ? "ON" : "off",
+                 recording, 0xC000);
+        drawChip(CXR, "Translate",
+                 translation ? trSub : "off",
+                 translation, 0x041F);
+    }
+
+    // 屏幕下半 — HOLD TO TALK 缩到 156..220（h=64），给 chip 让出 124..152
+    const int bx = 20, by = 156, bw = 280, bh = 64;
     uint16_t btnColor   = pressing ? TFT_RED   : 0x05FF;     // 青蓝色
     uint16_t textColor  = TFT_WHITE;
     M5.Display.fillRoundRect(bx, by, bw, bh, 16, btnColor);
@@ -212,6 +263,12 @@ void displayIdle(const char* topLine = "Pixel AI", const char* subLine = "", boo
     M5.Display.setTextSize(2);  // 复位到默认
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 }
+
+// IDLE 主屏 chip 触摸矩形（main.cpp 用）— REC / Translate
+static const int IDLE_REC_X1   = 12,  IDLE_REC_Y1   = 124;
+static const int IDLE_REC_X2   = 154, IDLE_REC_Y2   = 152;
+static const int IDLE_TRANS_X1 = 166, IDLE_TRANS_Y1 = 124;
+static const int IDLE_TRANS_X2 = 308, IDLE_TRANS_Y2 = 152;
 
 // ── 设置页面 ────────────────────────────────────────
 // 全屏：WiFi 信息（SSID/IP/RSSI）、电量、设备 token 短串
